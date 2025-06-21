@@ -8,16 +8,431 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import uuid
 import re
 import time
+import json
+import os
+import threading
+import paho.mqtt.client as mqtt
+from flask_socketio import SocketIO 
+from dotenv import load_dotenv
 
 
 app = Flask(__name__)
 
-print("Starting Flask application...")
+CORS(app,
+     supports_credentials=True,
+     origins=["http://localhost:3000"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"])
 
 
-CORS(app, 
-     resources={r"/api/*": {"origins": "http://localhost:3000"}},
-     supports_credentials=True)
+
+load_dotenv()
+
+# Database connection function
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),
+            database=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            port=os.getenv("DB_PORT"),
+            cursor_factory=RealDictCursor
+        )
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        return None
+
+# # MQTT broker config
+# # MQTT_BROKER = "172.16.4.62" 
+# # MQTT_BROKER = "127.0.0.1"  
+# MQTT_BROKER = "mqtt.zenvinnovations.com"  # Use localhost for local testing
+# MQTT_PORT = 9001  # Use WebSocket port
+# # MQTT_TOPIC = "/hotel/esp32/devices/#"
+# MQTT_TOPIC = "/RFID/access_control_data/product_id"  
+
+MQTT_BROKER = os.getenv("MQTT_BROKER")
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))  # Default to 1883 if not set
+MQTT_TOPIC = os.getenv("MQTT_TOPIC")
+
+
+mqtt_client = mqtt.Client(transport="websockets")  # Use WebSocket transport
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} with result code {rc}")
+        client.subscribe(MQTT_TOPIC)
+        print(f"Subscribed to topic {MQTT_TOPIC}")
+    else:
+        print(f"Failed to connect to MQTT broker. Return code: {rc}")
+
+def on_message(client, userdata, msg):
+    topic = msg.topic
+    payload = msg.payload.decode()
+    print(f"MQTT message received on topic {topic}: {payload}")
+    # Debugging: Log the received message
+    print(f"Debug: Received payload '{payload}' on topic '{topic}'")
+
+    # Avoid infinite loop by ignoring acknowledgment messages
+    if payload == "OK":
+        print(f"Ignoring acknowledgment message on topic '{topic}'")
+        return
+
+    # Send acknowledgment (ACK) back to the same topic
+    ack_message = "OK"
+    result = client.publish(topic, ack_message)
+    status = result[0]
+    if status == 0:
+        print(f"Sent acknowledgment '{ack_message}' to topic '{topic}'")
+    else:
+        print(f"Failed to send acknowledgment to topic '{topic}', status: {status}")
+
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+
+
+def on_disconnect(client, userdata, rc):
+    print(f"Disconnected from MQTT broker with result code {rc}")
+
+mqtt_client.on_disconnect = on_disconnect
+
+
+def mqtt_thread():
+    while True:
+        try:
+            print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} using WebSocket...")
+            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            mqtt_client.loop_forever()
+        except Exception as e:
+            print(f"Failed to connect to MQTT broker: {e}")
+            time.sleep(5)  # Retry after 5 seconds
+
+
+
+def publish_access_control_data(product_id, data_json):
+    """
+    Publish access control data JSON to MQTT topic for the given product_id.
+
+    Args:
+        product_id (str): The product ID to publish under.
+        data_json (dict): The JSON data (dict) to publish.
+    """
+    try:
+        # Compose MQTT topic dynamically based on product_id
+        topic = f"/RFID/access_control_data/{product_id}"
+
+        # Convert dict to JSON string
+        payload = json.dumps(data_json)
+
+        # Publish message
+        result = mqtt_client.publish(topic, payload)
+
+        status = result[0]
+        if status == 0:
+            print(f"Published access control data to topic '{topic}'")
+        else:
+            print(f"Failed to publish to topic '{topic}', status: {status}")
+
+    except Exception as e:
+        print(f"Error publishing access control data: {str(e)}")
+
+
+
+
+
+
+def mark_product_updated(product_id):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE productstable
+            SET updated = TRUE
+            WHERE product_id = %s
+        """, (product_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error marking product {product_id} updated: {str(e)}")
+
+def mark_products_updated_for_uid(uid):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT product_id
+            FROM access_requests
+            WHERE uid = %s
+        """, (uid,))
+        products = cursor.fetchall()
+        for p in products:
+            cursor.execute("""
+                UPDATE productstable
+                SET updated = TRUE
+                WHERE product_id = %s
+            """, (p['product_id'],))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error marking products updated for UID {uid}: {str(e)}")
+
+
+
+
+
+def fetch_access_control_data_for_product(product_id, cursor=None):
+    """
+    Fetch access control data for a specific product_id.
+    
+    Args:
+        product_id (str): Product ID to fetch data for
+        cursor: Optional database cursor. If None, a new connection is created.
+        
+    Returns:
+        dict: Access control data for the product
+    """
+    close_conn = False
+    conn = None
+    
+    try:
+        if cursor is None:
+            conn = get_db_connection()
+            if not conn:
+                return {'error': 'Unable to connect to database'}
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            close_conn = True
+        
+        # Initialize the response structure
+        response_data = {
+            "cards": [],
+            "products": []
+        }
+        
+        # 1. Fetch master cards and service cards
+        cursor.execute("""
+            SELECT cp.uid, cp.package_type as type, 
+                CASE WHEN cp.package_type IN ('Master Card', 'Service Card') THEN '["all"]'::json
+                    ELSE NULL
+                    END as access_rooms
+                FROM card_packages cp
+                WHERE cp.package_type IN ('Master Card', 'Service Card')
+                GROUP BY cp.uid, cp.package_type
+        """)
+        
+        special_cards = cursor.fetchall()
+        
+        # Process special cards
+        for card in special_cards:
+            card_data = dict(card)
+            
+            # Make sure access_rooms is properly processed
+            if isinstance(card_data['access_rooms'], str):
+                import json
+                card_data['access_rooms'] = json.loads(card_data['access_rooms'])
+            elif card_data['access_rooms'] is None:
+                card_data['access_rooms'] = ["all"]  # Both Service and Master cards get all access
+            
+            card_data['active'] = True
+            response_data['cards'].append(card_data)
+
+        # 2. First get the access matrix
+        cursor.execute("""
+            SELECT package_type, facility, has_access 
+            FROM access_matrix
+        """)
+        
+        package_access = {}
+        for row in cursor.fetchall():
+            pkg_type = row['package_type']
+            facility = row['facility']
+            has_access = row['has_access']
+            
+            if pkg_type not in package_access:
+                package_access[pkg_type] = {}
+                
+            package_access[pkg_type][facility] = has_access
+        
+        # 3. Get VIP room mappings
+        cursor.execute("""
+            SELECT product_id, vip_rooms 
+            FROM vip_rooms
+        """)
+        
+        vip_product_to_facility = {}
+        facility_to_product = {}
+        
+        for row in cursor.fetchall():
+            vip_product_to_facility[row['product_id']] = row['vip_rooms']
+            facility_to_product[row['vip_rooms']] = row['product_id']
+            
+        # 4. Get all active guests - using NOW() BETWEEN ensures only current guests are included
+        # Modified to ensure we only get guests with future checkout times
+        cursor.execute("""
+            SELECT g.id, g.name, g.card_ui_id as uid, g.room_id,
+                   g.checkin_time as checkin, g.checkout_time as checkout,
+                   p.product_id
+            FROM guest_registrations g
+            JOIN productstable p ON g.room_id = p.room_no
+            WHERE NOW() BETWEEN g.checkin_time AND g.checkout_time 
+            AND g.checkout_time > NOW()
+        """)
+
+        all_guests = cursor.fetchall()
+        
+        # 5. Get package type for each guest's card and simplify guest objects
+        guests_with_packages = []
+        for guest in all_guests:
+            guest_dict = dict(guest)
+            card_uid = guest_dict['uid']
+            
+            # Get package type for this card
+            cursor.execute("""
+                SELECT package_type
+                FROM card_packages
+                WHERE uid = %s
+                LIMIT 1
+            """, (card_uid,))
+            
+            package_result = cursor.fetchone()
+            if package_result:
+                guest_dict['package_type'] = package_result['package_type']
+            else:
+                guest_dict['package_type'] = 'General'  # Default if no package assigned
+                
+            # Calculate access rooms for this guest
+            access_rooms = [guest_dict['product_id']]  # Always has access to assigned room
+            
+            # Check which VIP facilities this package has access to
+            if guest_dict['package_type'] in package_access:
+                for facility, has_access in package_access[guest_dict['package_type']].items():
+                    if has_access and facility in facility_to_product:
+                        vip_product_id = facility_to_product[facility]
+                        access_rooms.append(vip_product_id)
+            
+            guest_dict['access_rooms'] = access_rooms
+
+            # Convert datetime objects to human-readable strings without the 'T'
+            if isinstance(guest_dict['checkin'], datetime):
+               guest_dict['checkin'] = guest_dict['checkin'].strftime('%Y-%m-%d %H:%M:%S')
+
+            if isinstance(guest_dict['checkout'], datetime):
+               guest_dict['checkout'] = guest_dict['checkout'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create simplified guest object with only necessary fields
+            simplified_guest = {
+                "name": guest_dict['name'],
+                "uid": guest_dict['uid'],
+                "checkin": guest_dict['checkin'],
+                "checkout": guest_dict['checkout'],
+                "package_type": guest_dict['package_type'],
+                "access_rooms": guest_dict['access_rooms']
+            }
+            
+            guests_with_packages.append(simplified_guest)
+        
+        # Create mappings for guests by their access products
+        guests_by_product = {}
+        for guest in guests_with_packages:
+            for product_id_item in guest['access_rooms']:
+                if product_id_item not in guests_by_product:
+                    guests_by_product[product_id_item] = []
+                guests_by_product[product_id_item].append(guest)
+        
+        # Check if it's a regular product
+        cursor.execute("""
+            SELECT product_id, room_no
+            FROM productstable
+            WHERE product_id = %s
+        """, (product_id,))
+        
+        regular_product = cursor.fetchone()
+        
+        if regular_product:
+            product_data = {
+                "product_id": regular_product['product_id'],
+                "updated": True,  # We're generating this for an update
+                "cards": []
+            }
+            
+            # Get cards
+            cursor.execute(""" 
+                SELECT ar.uid, 
+                    COALESCE(
+                        (SELECT package_type FROM card_packages WHERE uid = ar.uid AND package_type IN ('Master Card', 'Service Card') LIMIT 1),
+                        (SELECT package_type FROM card_packages WHERE uid = ar.uid AND product_id = %s LIMIT 1),
+                        'General'
+                    ) as type,
+                    TRUE as active
+                FROM access_requests ar
+                WHERE ar.product_id = %s
+                GROUP BY ar.uid
+            """, (product_id, product_id))
+
+            for card in cursor.fetchall():
+                product_data['cards'].append(dict(card))
+            
+            # Add guests if applicable
+            if product_id in guests_by_product:
+                product_data['guests'] = guests_by_product[product_id]
+            
+            response_data['products'].append(product_data)
+        
+        # Check if it's a VIP room
+        cursor.execute("""
+            SELECT product_id, vip_rooms
+            FROM vip_rooms
+            WHERE product_id = %s
+        """, (product_id,))
+        
+        vip_room = cursor.fetchone()
+        
+        if vip_room:
+            product_data = {
+                "product_id": vip_room['product_id'],
+                "updated": True,  # We're generating this for an update
+                "cards": []
+            }
+            
+            # Get cards
+            cursor.execute("""
+                SELECT ar.uid, 
+                       COALESCE(cp.package_type, 'General') as type,
+                       TRUE as active
+                FROM access_requests ar
+                LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
+                WHERE ar.product_id = %s
+                GROUP BY ar.uid, cp.package_type
+            """, (product_id,))
+            
+            for card in cursor.fetchall():
+                product_data['cards'].append(dict(card))
+            
+            # Add guests if any has access to this VIP room
+            if product_id in guests_by_product:
+                product_data['guests'] = guests_by_product[product_id]
+            
+            response_data['products'].append(product_data)
+        
+        if close_conn and conn:
+            cursor.close()
+            conn.close()
+        
+        return response_data
+        
+    except Exception as e:
+        print(f"Error fetching access control data for product {product_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        if close_conn and conn:
+            cursor.close()
+            conn.close()
+            
+        return {"error": str(e)}
+
 
 @app.route("/access", methods=["POST"])
 def handle_access():
@@ -81,7 +496,10 @@ def handle_access():
         conn.commit()
         cursor.close()
         conn.close()
-        
+
+        if product_id:
+            mark_product_updated(product_id)
+
         response_data = {
             "message": "Access request processed successfully",
             "data": data,
@@ -91,6 +509,8 @@ def handle_access():
         
         print("Response Data Sent to Client:", response_data)
         print("----- ACCESS REQUEST COMPLETED -----")
+
+
         return jsonify(response_data)
         
     except Exception as e:
@@ -108,28 +528,6 @@ def handle_access():
 # Simple session dictionary - will be reset on server restart
 active_sessions = {}
 
-# Database connection parameters
-DB_HOST = "localhost"
-DB_NAME = "accessdb"
-DB_USER = "postgres"
-DB_PASSWORD = "postgres"
-DB_PORT = "5432"
-
-# Database connection function
-def get_db_connection():
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT,
-            cursor_factory=RealDictCursor
-        )
-        return conn
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
 
 
 # # Helper function to convert database records to JSON-serializable format
@@ -208,110 +606,9 @@ print("Initializing users table...")
 init_users_table()
 
 
-#################
-# API ENDPOINTS #
-#################
-
-# DASHBOARD ENDPOINT
+# API ENDPOINTS 
 
 
-@app.route('/api/dashboard')
-# @api_auth_required
-def api_dashboard():
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({'error': 'Database connection failed'}), 500
-            
-        cursor = conn.cursor()
-        
-        # Total entries
-        cursor.execute("SELECT COUNT(*) as total FROM access_requests")
-        total_entries = cursor.fetchone()['total']
-        
-        # Today's entries
-        today = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE DATE(created_at) = %s", (today,))
-        today_entries = cursor.fetchone()['count']
-        
-        # Get unique rooms (assuming product_id is room)
-        cursor.execute("SELECT COUNT(DISTINCT product_id) as count FROM access_requests")
-        unique_rooms = cursor.fetchone()['count']
-        
-        # Get unique users (assuming uid is user)
-        cursor.execute("SELECT COUNT(DISTINCT uid) as count FROM access_requests")
-        unique_users = cursor.fetchone()['count']
-        
-        # Get access status counts
-        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE access_status LIKE '%Granted%'")
-        granted_count = cursor.fetchone()['count']
-        
-        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE access_status LIKE '%Denied%'")
-        denied_count = cursor.fetchone()['count']
-        
-        # Get daily trend data (last 7 days)
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=6)
-        
-        # Format dates for SQL
-        start_date_str = start_date.strftime('%Y-%m-%d')
-        end_date_str = (end_date + timedelta(days=1)).strftime('%Y-%m-%d')
-        
-        # Get daily counts
-        cursor.execute("""
-            SELECT DATE(created_at) as check_date, COUNT(*) as count
-            FROM access_requests
-            WHERE created_at >= %s AND created_at < %s
-            GROUP BY check_date
-            ORDER BY check_date
-        """, (start_date_str, end_date_str))
-        
-        daily_data = {}
-        for row in cursor.fetchall():
-            # Convert date to string for JSON serialization
-            daily_data[row['check_date'].strftime('%Y-%m-%d')] = row['count']
-        
-        # Fill in date sequence and counts
-        daily_labels = []
-        daily_counts = []
-        current_date = start_date
-        
-        while current_date <= end_date:
-            date_str = current_date.strftime('%Y-%m-%d')
-            daily_labels.append(date_str)
-            count = daily_data.get(date_str, 0)
-            daily_counts.append(count)
-            current_date += timedelta(days=1)
-        
-        # Get recent entries
-        cursor.execute("SELECT * FROM access_requests ORDER BY created_at DESC LIMIT 10")
-        recent_entries = cursor.fetchall()
-        
-        # Convert recent entries to serializable format
-        serialized_entries = []
-        for entry in recent_entries:
-            serialized_entry = serialize_record(entry)
-            serialized_entries.append(serialized_entry)
-        
-        cursor.close()
-        conn.close()
-        
-        return jsonify({
-            'total_entries': total_entries,
-            'today_entries': today_entries,
-            'unique_rooms': unique_rooms,
-            'unique_users': unique_users,
-            'granted_count': granted_count,
-            'denied_count': denied_count,
-            'daily_labels': daily_labels,
-            'daily_counts': daily_counts,
-            'recent_entries': serialized_entries
-        })
-    except Exception as e:
-        print(f"Dashboard API error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': 'An error occurred fetching dashboard data'}), 500
 
 @app.route('/api/rfid_entries')
 # @api_auth_required
@@ -350,7 +647,7 @@ def api_rfid_entries():
         conn.close()
         
         # Calculate total pages
-        total_pages = (total_entries + per_page - 1) // per_page
+        total_pages = (total_entries + per_page - 1) 
         
         return jsonify({
             'entries': serialized_entries,
@@ -362,8 +659,142 @@ def api_rfid_entries():
         print(f"RFID Entries API error: {e}")
         import traceback
         traceback.print_exc()
+        # socketio.emit('new_rfid_entry', new_entry)
         return jsonify({'error': 'An error occurred fetching RFID entries'}), 500
-    
+
+
+
+
+
+@app.route('/api/dashboard')
+# @api_auth_required
+def api_dashboard():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database connection failed'}), 500
+            
+        cursor = conn.cursor()
+        
+        # Total entries
+        cursor.execute("SELECT COUNT(*) as total FROM access_requests")
+        total_entries = cursor.fetchone()['total']
+        
+        # Today's entries
+        today = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE DATE(created_at) = %s", (today,))
+        today_entries = cursor.fetchone()['count']
+        
+        # Get unique rooms (assuming product_id is room)
+        cursor.execute("SELECT COUNT(DISTINCT product_id) as count FROM access_requests")
+        unique_rooms = cursor.fetchone()['count']
+        
+        # Get unique users (assuming uid is user)
+        cursor.execute("SELECT COUNT(DISTINCT uid) as count FROM access_requests")
+        unique_users = cursor.fetchone()['count']
+        
+        # Get access status counts
+        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE access_status LIKE '%Granted%'")
+        granted_count = cursor.fetchone()['count']
+        
+        cursor.execute("SELECT COUNT(*) as count FROM access_requests WHERE access_status LIKE '%Denied%'")
+        denied_count = cursor.fetchone()['count']
+        
+        # Get daily trend data (last 30 days)
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=29)
+        
+        # Format dates for SQL
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = (end_date + timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        # Get daily counts
+        cursor.execute("""
+            SELECT DATE(created_at) as check_date, COUNT(*) as count
+            FROM access_requests
+            WHERE created_at >= %s AND created_at < %s
+            GROUP BY check_date
+            ORDER BY check_date
+        """, (start_date_str, end_date_str))
+        
+        # Initialize with all dates in range having zero counts
+        daily_data = {}
+        current_date = start_date
+        while current_date <= end_date:
+            date_str = current_date.strftime('%Y-%m-%d')
+            daily_data[date_str] = 0
+            current_date += timedelta(days=1)
+            
+        # Fill in actual counts
+        results = cursor.fetchall()
+        for row in results:
+            date_str = row['check_date'].strftime('%Y-%m-%d')
+            daily_data[date_str] = row['count']
+        
+        # Convert to arrays for the response
+        date_labels = list(daily_data.keys())
+        daily_counts = list(daily_data.values())
+        
+        # Calculate average
+        avg_daily = sum(daily_counts) / len(daily_counts) if daily_counts else 0
+        
+        # Get max and min days
+        if daily_counts:
+            max_count = max(daily_counts)
+            max_day_idx = daily_counts.index(max_count)
+            max_day = date_labels[max_day_idx]
+            
+            min_count = min(daily_counts)
+            min_day_idx = daily_counts.index(min_count)
+            min_day = date_labels[min_day_idx]
+        else:
+            max_count = 0
+            max_day = 'N/A'
+            min_count = 0
+            min_day = 'N/A'
+
+        # Create daily entries structure for the dashboard
+        daily_entries = []
+        for i, date_str in enumerate(date_labels):
+            daily_entries.append({
+                "date": date_str,
+                "count": daily_counts[i]
+            })
+        
+        # Get recent entries
+        cursor.execute("SELECT * FROM access_requests ORDER BY created_at DESC LIMIT 10")
+        recent_entries = cursor.fetchall()
+        
+        # Convert recent entries to serializable format
+        serialized_entries = []
+        for entry in recent_entries:
+            serialized_entry = serialize_record(entry)
+            serialized_entries.append(serialized_entry)
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'total_entries': total_entries,
+            'today_entries': today_entries,
+            'unique_rooms': unique_rooms,
+            'unique_users': unique_users,
+            'granted_count': granted_count,
+            'denied_count': denied_count,
+            'daily_labels': date_labels,
+            'daily_counts': daily_counts,
+            'daily_entries': daily_entries,  # Added structured daily entries data
+            'recent_entries': serialized_entries,
+            'average_entries': round(avg_daily, 1),  # Added average
+            'peak_day': max_day,  # Added peak day
+            'peak_count': max_count  # Added peak count
+        })
+    except Exception as e:
+        print(f"Dashboard API error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'An error occurred fetching dashboard data'}), 500
+
 
 # CHECKIN TRENDS ENDPOINT
         
@@ -893,6 +1324,7 @@ def manage_tables_api():
                     
                     elif action == 'delete':
                         cursor.execute("DELETE FROM productstable WHERE product_id = %s", (product_id,))
+                        mark_product_updated(product_id)
                 
                 # Process card changes
                 for change in card_changes:
@@ -912,6 +1344,7 @@ def manage_tables_api():
                         card_id = change.get('card_id')
                         cursor.execute("DELETE FROM cardids WHERE product_id = %s AND cardids = %s", 
                                       (product_id, card_id))
+                        mark_product_updated(product_id)
                 
                 # Commit changes
                 conn.commit()
@@ -925,6 +1358,7 @@ def manage_tables_api():
                 
                 cursor.close()
                 conn.close()
+
                 
                 return jsonify({
                     'success': "Changes saved successfully!",
@@ -1599,16 +2033,364 @@ def migrate_added_by():
         traceback.print_exc()
         return jsonify({'error': f"Error during migration: {str(e)}"}), 500
 
+
+# Add these endpoints after your existing user APIs
+
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    """Update an existing user based on role permissions"""
+    try:
+        # Get current user from session/token
+        current_user = get_current_user_from_token()
+        if not current_user:
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        # Get data from request body
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        email = data.get('email')
+        password = data.get('password')  # Optional, only update if provided
+        role = data.get('role')
+        
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Unable to connect to database'}), 500
+            
+        cursor = conn.cursor()
+        
+        # Get existing user to check permissions
+        cursor.execute("SELECT id, email, role FROM users WHERE id = %s", (user_id,))
+        existing_user = cursor.fetchone()
+        
+        if not existing_user:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Check permissions - can't modify super_admin unless you are super_admin
+        if existing_user['role'] == 'super_admin' and current_user['role'] != 'super_admin':
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Only super_admin can modify super_admin users'}), 403
+        
+        # Check permissions - admins can't modify admins
+        if existing_user['role'] == 'admin' and current_user['role'] == 'admin':
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Admins cannot modify other admins'}), 403
+        
+        # Store original role for history
+        original_role = existing_user['role']
+        
+        # Build update query parts
+        update_parts = []
+        params = []
+        
+        # If role is changed and user has permission
+        if role and role != original_role:
+            # Check role permissions for the change
+            if role == 'super_admin' and current_user['role'] != 'super_admin':
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Only super_admin can promote to super_admin'}), 403
+                
+            if role == 'admin' and current_user['role'] not in ['super_admin']:
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Only super_admin can promote to admin'}), 403
+                
+            if role == 'manager' and current_user['role'] not in ['super_admin', 'admin']:
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Only super_admin or admin can promote to manager'}), 403
+                
+            update_parts.append("role = %s")
+            params.append(role)
+            
+            # Create history record for role change
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    change_type VARCHAR(50) NOT NULL,
+                    previous_value TEXT,
+                    new_value TEXT,
+                    changed_by_id INTEGER NOT NULL,
+                    changed_by_email VARCHAR(255) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            
+            cursor.execute("""
+                INSERT INTO user_history (
+                    user_id, change_type, previous_value, new_value, 
+                    changed_by_id, changed_by_email, timestamp
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id, 'role_change', original_role, role,
+                current_user['id'], current_user['email'], datetime.now()
+            ))
+        
+        # Update password if provided
+        if password:
+            hashed_password = generate_password_hash(password)
+            update_parts.append("password = %s")
+            params.append(hashed_password)
+            
+            # Create history record for password change (don't store the actual password)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    change_type VARCHAR(50) NOT NULL,
+                    previous_value TEXT,
+                    new_value TEXT,
+                    changed_by_id INTEGER NOT NULL,
+                    changed_by_email VARCHAR(255) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            
+            cursor.execute("""
+                INSERT INTO user_history (
+                    user_id, change_type, previous_value, new_value, 
+                    changed_by_id, changed_by_email, timestamp
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id, 'password_change', None, None,  # Don't store actual passwords
+                current_user['id'], current_user['email'], datetime.now()
+            ))
+        
+        # If we have fields to update, execute the update
+        if update_parts:
+            # Add the user_id at the end for the WHERE clause
+            params.append(user_id)
+            
+            query = f"UPDATE users SET {', '.join(update_parts)} WHERE id = %s"
+            cursor.execute(query, params)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            return jsonify({'message': 'User updated successfully'})
+        else:
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            return jsonify({'message': 'No changes to update'})
+        
+    except Exception as e:
+        print(f"Error updating user: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error updating user: {str(e)}"}), 500
+
+@app.route('/api/users/<int:user_id>/history', methods=['GET'])
+def get_user_history(user_id):
+    """Get history of changes made to a user"""
+    try:
+        # Get current user from session/token
+        current_user = get_current_user_from_token()
+        if not current_user:
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        # Check if user exists
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Unable to connect to database'}), 500
+            
+        cursor = conn.cursor()
+        
+        # Check if the user exists
+        cursor.execute("SELECT id, email, role FROM users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Check if user_history table exists, create if not
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_history (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                change_type VARCHAR(50) NOT NULL,
+                previous_value TEXT,
+                new_value TEXT,
+                changed_by_id INTEGER NOT NULL,
+                changed_by_email VARCHAR(255) NOT NULL,
+                timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        
+        # Get history records
+        cursor.execute("""
+            SELECT id, change_type, previous_value, new_value, 
+                   changed_by_id, changed_by_email, timestamp
+            FROM user_history
+            WHERE user_id = %s
+            ORDER BY timestamp DESC
+        """, (user_id,))
+        
+        history = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # Convert history records to serializable format
+        serialized_history = []
+        for record in history:
+            serialized_history.append({
+                'id': record['id'],
+                'change_type': record['change_type'],
+                'previous_value': record['previous_value'],
+                'new_value': record['new_value'],
+                'changed_by_id': record['changed_by_id'],
+                'changed_by_email': record['changed_by_email'],
+                'timestamp': record['timestamp'].isoformat() if isinstance(record['timestamp'], datetime) else record['timestamp']
+            })
+        
+        return jsonify({
+            'history': serialized_history,
+            'user_email': user['email']
+        })
+        
+    except Exception as e:
+        print(f"Error getting user history: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error getting user history: {str(e)}"}), 500
+
+# Add a route to handle OPTIONS requests for CORS preflight
+@app.route('/api/users/<int:user_id>', methods=['OPTIONS'])
+def options_user(user_id):
+    response = jsonify({})
+    response.headers.add('Access-Control-Allow-Methods', 'PUT, DELETE, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    return response
+
+
+
+
 # REGISTER GUEST ENDPOINT
 
 
 
 
+@app.route('/api/guests', methods=['GET'])
+def get_guests():
+    """Get all guest registrations"""
+    try:
+        # Get current user from session/token
+        current_user = get_current_user_from_token()
+        if not current_user:
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database",
+                'guests': []
+            }), 500
+            
+        cursor = conn.cursor()
+        
+        # Check if the table has the new columns
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'guest_registrations'
+                AND column_name = 'id_type'
+            )
+        """)
+        has_new_columns = cursor.fetchone()['exists']
+        
+        if has_new_columns:
+
+                cursor.execute("""
+                    SELECT id, guest_id, name, id_type, id_number, address, room_id, 
+                        card_ui_id, checkin_time, checkout_time, created_at
+                    FROM guest_registrations 
+                    WHERE checkout_time > NOW()  -- Only guests with future checkout times
+                    ORDER BY checkin_time DESC
+        """)
+        else:
+            # Query using old column names
+            cursor.execute("""
+                SELECT id, guest_id, name, 'aadhar' as id_type, aadhar_number as id_number, 
+                       address, room_id, card_ui_id, checkin_time, checkout_time, created_at
+                FROM guest_registrations 
+                ORDER BY created_at DESC
+            """)
+        
+        guests = cursor.fetchall()
+        
+        # Convert dates to ISO format for JSON serialization
+        if guests:
+            for guest in guests:
+                if 'checkin_time' in guest and guest['checkin_time']:
+                    if isinstance(guest['checkin_time'], datetime):
+                        guest['checkinTime'] = guest['checkin_time'].isoformat()
+                    del guest['checkin_time']
+                
+                if 'checkout_time' in guest and guest['checkout_time']:
+                    if isinstance(guest['checkout_time'], datetime):
+                        guest['checkoutTime'] = guest['checkout_time'].isoformat()
+                    del guest['checkout_time']
+                
+                if 'created_at' in guest and guest['created_at']:
+                    if isinstance(guest['created_at'], datetime):
+                        guest['createdAt'] = guest['created_at'].isoformat()
+                    del guest['created_at']
+                
+                if 'guest_id' in guest:
+                    guest['guestId'] = guest['guest_id']
+                    del guest['guest_id']
+                
+                if 'room_id' in guest:
+                    guest['roomId'] = guest['room_id']
+                    del guest['room_id']
+                
+                if 'card_ui_id' in guest:
+                    guest['cardUiId'] = guest['card_ui_id']
+                    del guest['card_ui_id']
+                
+                if 'id_number' in guest:
+                    guest['idNumber'] = guest['id_number']
+                    del guest['id_number']
+                
+                if 'id_type' in guest:
+                    guest['idType'] = guest['id_type']
+                    del guest['id_type']
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'guests': guests})
+        
+    except Exception as e:
+        print(f"Error getting guests: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': f"Error fetching guests: {str(e)}",
+            'guests': []
+        }), 500
 
 
-
-
-
+    
 @app.route('/api/register_guest', methods=['POST'])
 def register_guest():
     """Register a new guest with card and room access"""
@@ -1657,7 +2439,7 @@ def register_guest():
             return jsonify({'error': 'Unable to connect to database'}), 500
             
         cursor = conn.cursor()
-                # Check if guest_registrations table exists, create if not
+        # Check if guest_registrations table exists, create if not
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -1752,7 +2534,7 @@ def register_guest():
         
         new_guest_id = cursor.fetchone()['id']
         
-
+        # Get the product ID for this room
         cursor.execute("""
             SELECT product_id 
             FROM productstable 
@@ -1760,21 +2542,30 @@ def register_guest():
         """, (room_id,))
         
         product_result = cursor.fetchone()
+        product_id = None
+        
         if product_result:
             product_id = product_result['product_id']
             
-            # Update the productstable to set updated = FALSE
+            # Mark the product as updated
             cursor.execute("""
                 UPDATE productstable
                 SET updated = TRUE
                 WHERE product_id = %s
             """, (product_id,))
             
-            print(f"Marked product {product_id} as updated=FALSE for room {room_id}")
+            print(f"Marked product {product_id} as updated for room {room_id}")
         else:
             print(f"Warning: No product found for room {room_id}")
         
         conn.commit()
+        
+        # Fetch updated access control data for this product and publish it to MQTT
+        if product_id:
+            access_data = fetch_access_control_data_for_product(product_id, cursor)
+            conn.commit()
+            publish_access_control_data(product_id, access_data)
+        
         cursor.close()
         conn.close()
         
@@ -1791,110 +2582,6 @@ def register_guest():
         import traceback
         traceback.print_exc()
         return jsonify({'error': f"Error registering guest: {str(e)}"}), 500
-    
-
-
-
-
-@app.route('/api/guests', methods=['GET'])
-def get_guests():
-    """Get all guest registrations"""
-    try:
-        # Get current user from session/token
-        current_user = get_current_user_from_token()
-        if not current_user:
-            return jsonify({'error': 'Authentication required'}), 401
-            
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({
-                'error': "Unable to connect to database",
-                'guests': []
-            }), 500
-            
-        cursor = conn.cursor()
-        
-        # Check if the table has the new columns
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_schema = 'public' 
-                AND table_name = 'guest_registrations'
-                AND column_name = 'id_type'
-            )
-        """)
-        has_new_columns = cursor.fetchone()['exists']
-        
-        if has_new_columns:
-            # Query using new column names
-            cursor.execute("""
-                SELECT id, guest_id, name, id_type, id_number, address, room_id, 
-                       card_ui_id, checkin_time, checkout_time, created_at
-                FROM guest_registrations 
-                ORDER BY created_at DESC
-            """)
-        else:
-            # Query using old column names
-            cursor.execute("""
-                SELECT id, guest_id, name, 'aadhar' as id_type, aadhar_number as id_number, 
-                       address, room_id, card_ui_id, checkin_time, checkout_time, created_at
-                FROM guest_registrations 
-                ORDER BY created_at DESC
-            """)
-        
-        guests = cursor.fetchall()
-        
-        # Convert dates to ISO format for JSON serialization
-        if guests:
-            for guest in guests:
-                if 'checkin_time' in guest and guest['checkin_time']:
-                    if isinstance(guest['checkin_time'], datetime):
-                        guest['checkinTime'] = guest['checkin_time'].isoformat()
-                    del guest['checkin_time']
-                
-                if 'checkout_time' in guest and guest['checkout_time']:
-                    if isinstance(guest['checkout_time'], datetime):
-                        guest['checkoutTime'] = guest['checkout_time'].isoformat()
-                    del guest['checkout_time']
-                
-                if 'created_at' in guest and guest['created_at']:
-                    if isinstance(guest['created_at'], datetime):
-                        guest['createdAt'] = guest['created_at'].isoformat()
-                    del guest['created_at']
-                
-                if 'guest_id' in guest:
-                    guest['guestId'] = guest['guest_id']
-                    del guest['guest_id']
-                
-                if 'room_id' in guest:
-                    guest['roomId'] = guest['room_id']
-                    del guest['room_id']
-                
-                if 'card_ui_id' in guest:
-                    guest['cardUiId'] = guest['card_ui_id']
-                    del guest['card_ui_id']
-                
-                if 'id_number' in guest:
-                    guest['idNumber'] = guest['id_number']
-                    del guest['id_number']
-                
-                if 'id_type' in guest:
-                    guest['idType'] = guest['id_type']
-                    del guest['id_type']
-        
-        cursor.close()
-        conn.close()
-        
-        return jsonify({'guests': guests})
-        
-    except Exception as e:
-        print(f"Error getting guests: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'error': f"Error fetching guests: {str(e)}",
-            'guests': []
-        }), 500
 
 @app.route('/api/guests/<int:guest_id>', methods=['PUT'])
 def update_guest(guest_id):
@@ -1934,14 +2621,16 @@ def update_guest(guest_id):
             
         cursor = conn.cursor()
         
-        # Check if guest exists
-        cursor.execute("SELECT id FROM guest_registrations WHERE id = %s", (guest_id,))
+        # Get current room_id for the guest before updating
+        cursor.execute("SELECT room_id FROM guest_registrations WHERE id = %s", (guest_id,))
         existing_guest = cursor.fetchone()
         
         if not existing_guest:
             cursor.close()
             conn.close()
             return jsonify({'error': 'Guest not found'}), 404
+        
+        old_room_id = existing_guest['room_id']
         
         # Check if the table has the new columns
         cursor.execute("""
@@ -1977,7 +2666,31 @@ def update_guest(guest_id):
                 room_id, card_ui_id, checkin_time, checkout_time, guest_id
             ))
         
+        # Get product IDs for both old and new rooms
+        cursor.execute("SELECT product_id FROM productstable WHERE room_no = %s", (old_room_id,))
+        old_product = cursor.fetchone()
+        
+        cursor.execute("SELECT product_id FROM productstable WHERE room_no = %s", (room_id,))
+        new_product = cursor.fetchone()
+        
+        # Track products that need updating
+        products_to_update = set()
+        
+        if old_product and 'product_id' in old_product:
+            products_to_update.add(old_product['product_id'])
+            mark_product_updated(old_product['product_id'])
+        
+        if new_product and 'product_id' in new_product:
+            products_to_update.add(new_product['product_id'])
+            mark_product_updated(new_product['product_id'])
+        
         conn.commit()
+        
+        # Publish updated access control data for all affected products
+        for product_id in products_to_update:
+            access_data = fetch_access_control_data_for_product(product_id, cursor)
+            publish_access_control_data(product_id, access_data)
+        
         cursor.close()
         conn.close()
         
@@ -2004,21 +2717,38 @@ def delete_guest(guest_id):
             
         cursor = conn.cursor()
         
-        # Check if guest exists
-        cursor.execute("SELECT id FROM guest_registrations WHERE id = %s", (guest_id,))
-        existing_guest = cursor.fetchone()
+        # Fetch guest's product_id before delete
+        cursor.execute("""
+            SELECT p.product_id
+            FROM guest_registrations g
+            JOIN productstable p ON g.room_id = p.room_no
+            WHERE g.id = %s
+        """, (guest_id,))
+        product = cursor.fetchone()
         
-        if not existing_guest:
+        if not product:
             cursor.close()
             conn.close()
-            return jsonify({'error': 'Guest not found'}), 404
+            return jsonify({'error': 'Guest not found or no product associated with room'}), 404
+        
+        product_id = product['product_id']
         
         # Delete guest record
         cursor.execute("DELETE FROM guest_registrations WHERE id = %s", (guest_id,))
         
+        # Mark the product as updated
+        mark_product_updated(product_id)
+        
         conn.commit()
+        
+        # Fetch updated access control data
+        access_data = fetch_access_control_data_for_product(product_id, cursor)
+        
         cursor.close()
         conn.close()
+        
+        # Publish the updated access control data to MQTT
+        publish_access_control_data(product_id, access_data)
         
         return jsonify({'message': 'Guest deleted successfully'})
         
@@ -2027,11 +2757,130 @@ def delete_guest(guest_id):
         import traceback
         traceback.print_exc()
         return jsonify({'error': f"Error deleting guest: {str(e)}"}), 500
-    
 
 
+@app.route('/api/guests/past', methods=['GET'])
+def get_past_guests():
+    """Get all past guest registrations (checkout time has passed)"""
+    try:
+        # Get authentication token
+        auth_header = request.headers.get('Authorization')
+        print(f"Auth header received: {auth_header}")
+        
+        # Get current user from session/token
+        current_user = get_current_user_from_token()
+        if not current_user:
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database",
+                'past_guests': []
+            }), 500
+            
+        cursor = conn.cursor()
+        
+        # Check if the table has the new columns
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'guest_registrations'
+                AND column_name = 'id_type'
+            )
+        """)
+        has_new_columns = cursor.fetchone()['exists']
+        
+        if has_new_columns:
+            # Query using new column names for past guests only
+            cursor.execute("""
+                SELECT id, guest_id, name, id_type, id_number, address, room_id, 
+                       card_ui_id, checkin_time, checkout_time, created_at
+                FROM guest_registrations 
+                WHERE checkout_time < NOW()
+                ORDER BY checkout_time DESC
+            """)
+        else:
+            # Query using old column names for past guests only
+            cursor.execute("""
+                SELECT id, guest_id, name, 'aadhar' as id_type, aadhar_number as id_number, 
+                       address, room_id, card_ui_id, checkin_time, checkout_time, created_at
+                FROM guest_registrations 
+                WHERE checkout_time < NOW()
+                ORDER BY checkout_time DESC
+            """)
+        
+        past_guests = cursor.fetchall()
+        
+        # Convert dates to ISO format for JSON serialization
+        if past_guests:
+            for guest in past_guests:
+                if 'checkin_time' in guest and guest['checkin_time']:
+                    if isinstance(guest['checkin_time'], datetime):
+                        guest['checkinTime'] = guest['checkin_time'].isoformat()
+                    del guest['checkin_time']
+                
+                if 'checkout_time' in guest and guest['checkout_time']:
+                    if isinstance(guest['checkout_time'], datetime):
+                        guest['checkoutTime'] = guest['checkout_time'].isoformat()
+                    del guest['checkout_time']
+                
+                if 'created_at' in guest and guest['created_at']:
+                    if isinstance(guest['created_at'], datetime):
+                        guest['createdAt'] = guest['created_at'].isoformat()
+                    del guest['created_at']
+                
+                if 'guest_id' in guest:
+                    guest['guestId'] = guest['guest_id']
+                    del guest['guest_id']
+                
+                if 'room_id' in guest:
+                    guest['roomId'] = guest['room_id']
+                    del guest['room_id']
+                
+                if 'card_ui_id' in guest:
+                    guest['cardUiId'] = guest['card_ui_id']
+                    del guest['card_ui_id']
+                
+                if 'id_number' in guest:
+                    guest['idNumber'] = guest['id_number']
+                    del guest['id_number']
+                
+                if 'id_type' in guest:
+                    guest['idType'] = guest['id_type']
+                    del guest['id_type']
+                    
+                # Add stay duration calculation
+                if 'checkinTime' in guest and 'checkoutTime' in guest:
+                    try:
+                        checkin = datetime.fromisoformat(guest['checkinTime'])
+                        checkout = datetime.fromisoformat(guest['checkoutTime'])
+                        stay_days = (checkout - checkin).days
+                        guest['stayDuration'] = stay_days
+                    except:
+                        guest['stayDuration'] = 0
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'past_guests': past_guests,
+            'count': len(past_guests)
+        })
+        
+    except Exception as e:
+        print(f"Error getting past guests: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': f"Error fetching past guests: {str(e)}",
+            'past_guests': []
+        }), 500
 
-    
+
 @app.route('/api/help-messages', methods=['GET'])
 def get_help_messages():
     """Get help desk messages based on user's role"""
@@ -2074,6 +2923,16 @@ def get_help_messages():
                 SELECT * FROM help_messages
                 ORDER BY timestamp DESC
             """)
+
+        # Modified query for admin role
+        # if current_user['role'] == 'admin':
+        #     cursor.execute("""
+        #         SELECT * FROM help_messages
+        #         WHERE sender = %s OR recipient = %s OR recipient_role = 'admin'
+        #         ORDER BY timestamp DESC
+        #     """, (current_user['email'], current_user['email']))
+
+
         elif current_user['role'] == 'manager':
             cursor.execute("""
                 SELECT * FROM help_messages
@@ -2279,6 +3138,90 @@ def get_helpdesk_recipients():
 
 
 
+@app.route('/api/help-messages/<int:message_id>/status', methods=['PUT']) 
+def update_message_status(message_id):
+    """Update the status of a help desk message"""
+    try:
+        # Get current user from token
+        current_user = get_current_user_from_token()
+        if not current_user:
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        # Get status from request
+        data = request.get_json()
+        if not data or 'status' not in data:
+            return jsonify({'error': 'Status is required'}), 400
+            
+        new_status = data['status']
+        
+        # Validate status
+        valid_statuses = ['open', 'in_progress', 'resolved']
+        if new_status not in valid_statuses:
+            return jsonify({'error': f'Invalid status. Must be one of: {", ".join(valid_statuses)}'}), 400
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database connection failed'}), 500
+            
+        cursor = conn.cursor()
+        
+        # Check if message exists and if user has access
+        cursor.execute("""
+            SELECT sender, recipient, sender_role, recipient_role
+            FROM help_messages WHERE id = %s
+        """, (message_id,))
+        
+        message = cursor.fetchone()
+        if not message:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Message not found'}), 404
+            
+        # Check access rights
+        has_access = False
+        if current_user['role'] == 'admin':
+            has_access = True
+        elif current_user['role'] == 'manager':
+            has_access = (
+                message['sender'] == current_user['email'] or
+                message['recipient'] == current_user['email'] or
+                message['sender_role'] == 'clerk' or
+                (message['recipient_role'] == 'clerk' and message['sender'] == current_user['email'])
+            )
+        else:
+            has_access = (
+                message['sender'] == current_user['email'] or
+                message['recipient'] == current_user['email']
+            )
+            
+        if not has_access:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Access denied'}), 403
+        
+        # Insert or update the status
+        cursor.execute("""
+            INSERT INTO help_message_status (message_id, status, updated_by)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (message_id) 
+            DO UPDATE SET status = %s, updated_at = NOW(), updated_by = %s
+        """, (message_id, new_status, current_user['email'], new_status, current_user['email']))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': f'Status updated to {new_status}'
+        })
+        
+    except Exception as e:
+        print(f"Error updating message status: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error updating status: {str(e)}"}), 500
+
+
 
 
 
@@ -2286,8 +3229,6 @@ def get_helpdesk_recipients():
 @app.route('/api/card_packages', methods=['GET'])
 def get_card_packages():
     """API endpoint for getting all card packages"""
-    # Check authentication (middleware would handle this in a real app)
-    
     conn = get_db_connection()
     
     if not conn:
@@ -2316,14 +3257,16 @@ def get_card_packages():
                 # Try to access by index (tuple-like)
                 try:
                     packages.append({
-                        'product_id': row[0],
-                        'uid': row[1],
-                        'package_type': row[2]
+                        'id': row[0],
+                        'product_id': row[1],
+                        'uid': row[2],
+                        'package_type': row[3]
                     })
                 except (IndexError, TypeError):
                     # If that fails, try to access by column name
                     try:
                         packages.append({
+                            'id': row.id,
                             'product_id': row.product_id,
                             'uid': row.uid,
                             'package_type': row.package_type
@@ -2349,11 +3292,10 @@ def get_card_packages():
             'error': f"Error fetching card packages: {str(e)}"
         }), 500
 
+
 @app.route('/api/card_packages', methods=['POST'])
 def add_card_package():
     """API endpoint for adding or updating a card package"""
-    # Check authentication (middleware would handle this in a real app)
-    
     conn = get_db_connection()
     
     if not conn:
@@ -2374,14 +3316,14 @@ def add_card_package():
         uid = data.get('uid')
         package_type = data.get('package_type')
         
-        if not product_id or not uid or not package_type:
+        if not uid or not package_type:
             return jsonify({
-                'error': "Product ID, UID, and package type are required"
+                'error': "UID and package type are required"
             }), 400
         
         cursor = conn.cursor()
         
-        # Upsert the card package
+        # Upsert the card package (without trying to return an ID)
         cursor.execute("""
             INSERT INTO card_packages (product_id, uid, package_type) 
             VALUES (%s, %s, %s)
@@ -2389,8 +3331,34 @@ def add_card_package():
             SET package_type = EXCLUDED.package_type
         """, (product_id, uid, package_type))
         
+        # Mark the product as updated if specified
+        affected_products = []
+        if product_id:
+            mark_product_updated(product_id)
+            affected_products.append(product_id)
+            
+        # Also mark all other products this UID has access to
+        cursor.execute("""
+            SELECT DISTINCT product_id
+            FROM access_requests
+            WHERE uid = %s AND product_id != %s
+        """, (uid, product_id if product_id else ''))
+        
+        for row in cursor.fetchall():
+            if row['product_id']:
+                mark_product_updated(row['product_id'])
+                affected_products.append(row['product_id'])
+        
         # Commit changes
         conn.commit()
+        
+        # Publish updates to MQTT for all affected products
+        for prod_id in affected_products:
+            # Fetch updated access control data
+            access_data = fetch_access_control_data_for_product(prod_id)
+            
+            # Publish to MQTT
+            publish_access_control_data(prod_id, access_data)
         
         cursor.close()
         conn.close()
@@ -2412,14 +3380,228 @@ def add_card_package():
             'error': f"Error updating card package: {str(e)}"
         }), 500
 
-
+@app.route('/api/card_packages/<int:package_id>', methods=['PUT'])
+def update_card_package(package_id):
+    """API endpoint for updating an existing card package"""
+    conn = get_db_connection()
     
+    if not conn:
+        return jsonify({
+            'error': "Unable to connect to database"
+        }), 500
+    
+    try:
+        # Get request JSON data
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'error': "No data provided"
+            }), 400
+        
+        # Get data from request
+        product_id = data.get('product_id')
+        uid = data.get('uid')
+        package_type = data.get('package_type')
+        
+        # Check if at least one field is provided
+        if product_id is None and uid is None and package_type is None:
+            return jsonify({
+                'error': "At least one field to update is required"
+            }), 400
+        
+        cursor = conn.cursor()
+        
+        # First get the current package data to know what's changing
+        cursor.execute("""
+            SELECT product_id, uid FROM card_packages WHERE id = %s
+        """, (package_id,))
+        
+        existing = cursor.fetchone()
+        if not existing:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': "Card package not found"
+            }), 404
+        
+        old_product_id = existing['product_id']
+        old_uid = existing['uid']
+        
+        # Build the update query dynamically based on what fields are provided
+        update_parts = []
+        params = []
+        
+        if product_id is not None:
+            update_parts.append("product_id = %s")
+            params.append(product_id)
+            
+        if uid is not None:
+            update_parts.append("uid = %s")
+            params.append(uid)
+            
+        if package_type is not None:
+            update_parts.append("package_type = %s")
+            params.append(package_type)
+            
+        # Add the package_id at the end for the WHERE clause
+        params.append(package_id)
+        
+        # Execute the update if there are fields to update
+        if update_parts:
+            query = f"UPDATE card_packages SET {', '.join(update_parts)} WHERE id = %s"
+            cursor.execute(query, params)
+        
+        # Determine which products need to be marked as updated
+        products_to_update = set()
+        
+        # Always update the old product_id if it exists
+        if old_product_id:
+            products_to_update.add(old_product_id)
+        
+        # If product_id was changed, also update the new one
+        if product_id and product_id != old_product_id:
+            products_to_update.add(product_id)
+        
+        # Update each affected product and publish changes
+        for prod_id in products_to_update:
+            mark_product_updated(prod_id)
+            access_data = fetch_access_control_data_for_product(prod_id, cursor)
+            # Will publish after commit
+            
+        # If UID changed, update all products associated with either old or new UID
+        if uid and uid != old_uid:
+            # Get all products associated with the old UID
+            cursor.execute("""
+                SELECT DISTINCT product_id FROM card_packages 
+                WHERE uid = %s AND product_id IS NOT NULL AND product_id != %s
+            """, (old_uid, old_product_id if old_product_id else ''))
+            
+            for row in cursor.fetchall():
+                prod_id = row['product_id']
+                if prod_id not in products_to_update:
+                    products_to_update.add(prod_id)
+                    mark_product_updated(prod_id)
+            
+            # Get all products associated with the new UID
+            cursor.execute("""
+                SELECT DISTINCT product_id FROM card_packages 
+                WHERE uid = %s AND product_id IS NOT NULL AND product_id != %s
+            """, (uid, product_id if product_id else ''))
+            
+            for row in cursor.fetchall():
+                prod_id = row['product_id']
+                if prod_id not in products_to_update:
+                    products_to_update.add(prod_id)
+                    mark_product_updated(prod_id)
+        
+        # Commit changes
+        conn.commit()
+        
+        # Now publish updates for all affected products
+        for prod_id in products_to_update:
+            access_data = fetch_access_control_data_for_product(prod_id)
+            publish_access_control_data(prod_id, access_data)
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'success': "Card package updated successfully!"
+        })
+        
+    except Exception as e:
+        # Rollback in case of error
+        if conn:
+            conn.rollback()
+        
+        import traceback
+        print("Error in update_card_package API:")
+        print(traceback.format_exc())
+        
+        return jsonify({
+            'error': f"Error updating card package: {str(e)}"
+        }), 500
+
+@app.route('/api/card_packages/<int:package_id>', methods=['DELETE'])
+def delete_card_package(package_id):
+    """API endpoint for deleting a card package"""
+    conn = get_db_connection()
+    
+    if not conn:
+        return jsonify({
+            'error': "Unable to connect to database"
+        }), 500
+    
+    try:
+        cursor = conn.cursor()
+        
+        # First get the product_id and uid to know what needs updating
+        cursor.execute("""
+            SELECT product_id, uid FROM card_packages WHERE id = %s
+        """, (package_id,))
+        
+        package = cursor.fetchone()
+        if not package:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': "Card package not found"
+            }), 404
+        
+        product_id = package['product_id']
+        uid = package['uid']
+        
+        # Delete the card package
+        cursor.execute("DELETE FROM card_packages WHERE id = %s", (package_id,))
+        
+        # Mark the product as updated
+        if product_id:
+            mark_product_updated(product_id)
+            
+            # Fetch updated access control data for this product
+            access_data = fetch_access_control_data_for_product(product_id, cursor)
+        
+        # Commit changes
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        # Publish the updated access control data to MQTT
+        if product_id:
+            publish_access_control_data(product_id, access_data)
+        
+        return jsonify({
+            'success': "Card package deleted successfully!"
+        })
+        
+    except Exception as e:
+        # Rollback in case of error
+        if conn:
+            conn.rollback()
+        
+        import traceback
+        print("Error in delete_card_package API:")
+        print(traceback.format_exc())
+        
+        return jsonify({
+            'error': f"Error deleting card package: {str(e)}"
+        }), 500
+
+@app.route('/api/card_packages', methods=['OPTIONS'])
+def options_card_packages():
+    """Handle OPTIONS preflight requests for the card_packages endpoint"""
+    response = app.make_default_options_response()
+    response.headers.add('Access-Control-Allow-Methods', 'GET')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    return response
+
+
+
 
 @app.route('/api/access_matrix', methods=['GET'])   
 def get_access_matrix():
     """API endpoint for getting the package access matrix"""
-    # Check authentication (middleware would handle this in a real app)
-    
     conn = get_db_connection()
     
     if not conn:
@@ -2494,133 +3676,124 @@ def get_access_matrix():
         return jsonify({
             'error': f"Error fetching access matrix: {str(e)}"
         }), 500
-    
 
-# @app.route('/api/access_matrix', methods=['POST'])
-# def update_access_matrix():
-#     """API endpoint for updating the package access matrix"""
-#     # Check authentication (middleware would handle this in a real app)
-    
-#     conn = get_db_connection()
-    
-#     if not conn:
-#         return jsonify({
-#             'error': "Unable to connect to database"
-#         }), 500
-    
-#     try:
-#         # Get request JSON data
-#         data = request.get_json()
-        
-#         if not data or 'matrix' not in data:
-#             return jsonify({
-#                 'error': "No matrix data provided"
-#             }), 400
-        
-#         matrix = data['matrix']
-        
-#         cursor = conn.cursor()
-        
-#         # Clear existing matrix data
-#         cursor.execute("DELETE FROM access_matrix")
-        
-#         # Insert new matrix data
-#         for package_type, facilities in matrix.items():
-#             for facility, has_access in facilities.items():
-#                 cursor.execute("""
-#                     INSERT INTO access_matrix (package_type, facility, has_access)
-#                     VALUES (%s, %s, %s)
-#                 """, (package_type, facility, has_access))
-        
-#         # Commit changes
-#         conn.commit()
-        
-#         cursor.close()
-#         conn.close()
-        
-#         return jsonify({
-#             'success': "Access matrix updated successfully!"
-#         })
-        
-#     except Exception as e:
-#         # Rollback in case of error
-#         if conn:
-#             conn.rollback()
-        
-#         import traceback
-#         print("Error in update_access_matrix API:")
-#         print(f"Exception type: {type(e).__name__}")
-#         print(f"Exception args: {e.args}")
-#         print(traceback.format_exc())
-        
-#         return jsonify({
-#             'error': f"Error updating access matrix: {str(e)}"
-#         }), 500
-    
+
+
 @app.route('/api/access_matrix', methods=['POST'])
 def update_access_matrix():
     """API endpoint for updating the package access matrix"""
-    # Check authentication (middleware would handle this in a real app)
-    
-    conn = get_db_connection()
-    
-    if not conn:
-        return jsonify({
-            'error': "Unable to connect to database"
-        }), 500
-    
     try:
         # Get request JSON data
         data = request.get_json()
         
         if not data or 'matrix' not in data:
-            return jsonify({
-                'error': "No matrix data provided"
-            }), 400
+            return jsonify({'error': "No matrix data provided"}), 400
         
         matrix = data['matrix']
+        print(f"Received matrix data: {json.dumps(matrix, indent=2)}")
         
+        # Use a simple approach with autocommit enabled
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': "Unable to connect to database"}), 500
+        
+        # Enable autocommit to avoid transaction issues
+        conn.autocommit = True
         cursor = conn.cursor()
         
-        # Clear existing matrix data
-        cursor.execute("DELETE FROM access_matrix")
+        # Get current matrix for comparison
+        cursor.execute("SELECT package_type, facility, has_access FROM access_matrix")
+        current_matrix = {}
         
-        # Insert new matrix data
-        id_counter = 1  # Start ID counter at 1
+        for row in cursor.fetchall():
+            package_type = row['package_type']
+            facility = row['facility']
+            has_access = row['has_access']
+            
+            if package_type not in current_matrix:
+                current_matrix[package_type] = {}
+            
+            current_matrix[package_type][facility] = has_access
+        
+        print(f"Current matrix in DB: {json.dumps(current_matrix, indent=2)}")
+        
+        updated_facilities = set()
+        
+        # Process each update individually
         for package_type, facilities in matrix.items():
             for facility, has_access in facilities.items():
+                print(f"Processing: {package_type} -> {facility} -> {has_access}")
+                
+                # Check if record exists
                 cursor.execute("""
-                    INSERT INTO access_matrix (id, package_type, facility, has_access)
-                    VALUES (%s, %s, %s, %s)
-                """, (id_counter, package_type, facility, has_access))
-                id_counter += 1  # Increment ID for each row
+                    SELECT has_access FROM access_matrix 
+                    WHERE package_type = %s AND facility = %s
+                """, (package_type, facility))
+                
+                result = cursor.fetchone()
+                
+                if result:
+                    # Record exists, update it
+                    current_access = result['has_access']
+                    if current_access != has_access:
+                        print(f"Updating: {package_type}, {facility}: {current_access} -> {has_access}")
+                        cursor.execute("""
+                            UPDATE access_matrix 
+                            SET has_access = %s 
+                            WHERE package_type = %s AND facility = %s
+                        """, (has_access, package_type, facility))
+                        updated_facilities.add(facility)
+                    else:
+                        print(f"No change needed for: {package_type}, {facility}")
+                else:
+                    # Record doesn't exist, insert it
+                    print(f"Inserting new record: {package_type}, {facility}, {has_access}")
+                    cursor.execute("""
+                        INSERT INTO access_matrix (package_type, facility, has_access)
+                        VALUES (%s, %s, %s)
+                    """, (package_type, facility, has_access))
+                    updated_facilities.add(facility)
         
-        # Commit changes
-        conn.commit()
+        print("All database changes completed successfully")
+        
+        # Handle MQTT updates
+        if updated_facilities:
+            print(f"Updating facilities via MQTT: {updated_facilities}")
+            for facility in updated_facilities:
+                try:
+                    cursor.execute("SELECT product_id FROM vip_rooms WHERE vip_rooms = %s", (facility,))
+                    result = cursor.fetchone()
+                    if result:
+                        product_id = result['product_id']
+                        mark_product_updated(product_id)
+                        print(f"Marked product {product_id} as updated for facility {facility}")
+                except Exception as mqtt_error:
+                    print(f"Warning: Could not update MQTT for facility {facility}: {mqtt_error}")
         
         cursor.close()
         conn.close()
         
-        return jsonify({
-            'success': "Access matrix updated successfully!"
-        })
+        return jsonify({'success': "Access matrix updated successfully!"})
         
     except Exception as e:
-        # Rollback in case of error
-        if conn:
-            conn.rollback()
-        
+        print(f"Error in update_access_matrix: {e}")
         import traceback
-        print("Error in update_access_matrix API:")
-        print(f"Exception type: {type(e).__name__}")
-        print(f"Exception args: {e.args}")
-        print(traceback.format_exc())
+        traceback.print_exc()
         
-        return jsonify({
-            'error': f"Error updating access matrix: {str(e)}"
-        }), 500
-# VIP Table API Endpoints
+        # Clean up connections
+        try:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+            if 'conn' in locals() and conn:
+                conn.close()
+        except:
+            pass
+            
+        return jsonify({'error': f"Error updating access matrix: {str(e)}"}), 500
 
+
+
+# vip tables endpoint
 @app.route('/api/vip_rooms', methods=['GET'])
 def get_vip_rooms():
     """API endpoint for retrieving VIP rooms"""
@@ -2723,6 +3896,8 @@ def add_vip_room():
             INSERT INTO vip_rooms (product_id, vip_rooms) 
             VALUES (%s, %s)
         """, (product_id, vip_rooms))
+        mark_product_updated(product_id)
+
         
         # Commit changes
         conn.commit()
@@ -2751,6 +3926,8 @@ def add_vip_room():
             'error': f"Error adding VIP Room: {str(e)}"
         }), 500
 
+
+
 @app.route('/api/vip_room/<product_id>', methods=['DELETE'])
 def delete_vip_room(product_id):
     """API endpoint for deleting a single VIP room"""
@@ -2768,6 +3945,7 @@ def delete_vip_room(product_id):
         
         # Delete the VIP room
         cursor.execute("DELETE FROM vip_rooms WHERE product_id = %s", (product_id,))
+        mark_product_updated(product_id)
         
         # Check if VIP room was actually deleted
         if cursor.rowcount == 0:
@@ -2803,672 +3981,1281 @@ def delete_vip_room(product_id):
     
 
 
+@app.route('/api/routes', methods=['GET'])
+def list_routes():
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': [method for method in rule.methods if method not in ('HEAD', 'OPTIONS')],
+            'route': str(rule)
+        })
+    return jsonify(routes)
+
+
+
+
+
+
+
+# Define file paths for health data storage
+HEALTH_DATA_DIR = 'health_data'
+HEALTH_HISTORY_DIR = 'health_history'
+
+# Store health data per room ID
+latest_health_data = {}
+health_history = {}
+MAX_HISTORY_ENTRIES = 50 
+
+# Ensure directories exist
+def ensure_directories():
+    try:
+        if not os.path.exists(HEALTH_DATA_DIR):
+            os.makedirs(HEALTH_DATA_DIR)
+        if not os.path.exists(HEALTH_HISTORY_DIR):
+            os.makedirs(HEALTH_HISTORY_DIR)
+    except Exception as e:
+        print(f"Error creating directories: {e}")
+
+# Load data from disk at startup
+def load_health_data():
+    global latest_health_data, health_history
+    try:
+        ensure_directories()
+
+        # Load latest health data for each room
+        if os.path.exists(HEALTH_DATA_DIR):
+            for filename in os.listdir(HEALTH_DATA_DIR):
+                if filename.endswith('.json'):
+                    room_id = filename[:-5] # Remove .json extension
+                    file_path = os.path.join(HEALTH_DATA_DIR, filename)
+                    with open(file_path, 'r') as f:
+                        latest_health_data[room_id] = json.load(f)
+                        print(f"Loaded health data for room {room_id}")
+
+        # Load history data for each room
+        if os.path.exists(HEALTH_HISTORY_DIR):
+            for filename in os.listdir(HEALTH_HISTORY_DIR):
+                if filename.endswith('.json'):
+                    room_id = filename[:-5] # Remove .json extension
+                    file_path = os.path.join(HEALTH_HISTORY_DIR, filename)
+                    with open(file_path, 'r') as f:
+                        health_history[room_id] = json.load(f)
+                        print(f"Loaded {len(health_history[room_id])} history entries for room {room_id}")
+
+    except Exception as e:
+        print(f"Error loading health data from disk: {e}")
+
+# Save data to disk
+def save_health_data(room_id):
+    try:
+        ensure_directories()
+        file_path = os.path.join(HEALTH_DATA_DIR, f"{room_id}.json")
+        with open(file_path, 'w') as f:
+            json.dump(latest_health_data[room_id], f)
+    except Exception as e:
+        print(f"Error saving health data for {room_id}: {e}")
+
+def save_health_history(room_id):
+    try:
+        ensure_directories()
+        file_path = os.path.join(HEALTH_HISTORY_DIR, f"{room_id}.json")
+        with open(file_path, 'w') as f:
+            json.dump(health_history[room_id], f)
+    except Exception as e:
+        print(f"Error saving health history for {room_id}: {e}")
+
+# Load data at application startup
+load_health_data()
+
+
+# --- API Endpoints ---
+
+
+
+
+@app.route('/api/system_health', methods=['GET', 'POST'])
+def system_health():
+    """
+    API Endpoint to handle system health status by room ID or VIP room name.
+    - GET request: Returns health status for a specific room_id or vip_room
+    - POST request: Receives health status data from a hardware device and stores it
+    """
+    global latest_health_data, health_history
+
+    if request.method == 'POST':
+        try:
+            # Get the JSON data sent by the hardware device
+            data = request.get_json()
+            print(f"Received health update from device: {json.dumps(data, indent=2)}")
+
+            room_id = None
+            
+            # Check if it's a regular room submission
+            if "room_id" in data:
+                room_id = data["room_id"]
+                print(f"Processing health data for regular room: {room_id}")
+            
+            # Check if it's a VIP room submission
+            elif "vip_rooms" in data:
+                vip_room_name = data["vip_rooms"]
+                print(f"Processing health data for VIP room: {vip_room_name}")
+                
+                # Look up the product_id for this VIP room name
+                try:
+                    conn = get_db_connection()
+                    if not conn:
+                        return jsonify({"error": "Database connection failed"}), 500
+                        
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT product_id FROM vip_rooms WHERE vip_rooms = %s", (vip_room_name,))
+                    result = cursor.fetchone()
+                    cursor.close()
+                    conn.close()
+                    
+                    if result:
+                        room_id = result['product_id']
+                        print(f"Mapped VIP room '{vip_room_name}' to product_id '{room_id}'")
+                        
+                        # Replace vip_rooms with room_id in the data for storage
+                        data.pop("vip_rooms")
+                        data["room_id"] = room_id
+                        data["vip_room_name"] = vip_room_name  # Store the original name for reference
+                    else:
+                        return jsonify({
+                            "error": f"No VIP room found with name '{vip_room_name}'",
+                            "vip_room": vip_room_name
+                        }), 404
+                except Exception as e:
+                    print(f"Error looking up VIP room: {e}")
+                    return jsonify({"error": f"Error looking up VIP room: {e}"}), 500
+            
+            # Validate the incoming data structure and the room_id
+            if room_id and "system_health" in data and all(key in data["system_health"] for key in ["rtc", "wifi", "internet", "ota"]):
+                # Add timestamp for this update
+                timestamp = datetime.now().isoformat()
+                data_with_timestamp = {
+                    "timestamp": timestamp,
+                    **data  # Include all the original data
+                }
+                
+                # Initialize history for this room if it doesn't exist
+                if room_id not in health_history:
+                    health_history[room_id] = []
+                
+                # Store in history
+                health_history[room_id].append(data_with_timestamp)
+                # Keep only the latest MAX_HISTORY_ENTRIES entries
+                health_history[room_id] = health_history[room_id][-MAX_HISTORY_ENTRIES:]
+                # Save history to disk
+                save_health_history(room_id)
+                
+                # Update latest health data
+                latest_health_data[room_id] = data
+                # Save data to disk
+                save_health_data(room_id)
+                
+                print(f"Health data updated successfully for room {room_id} and saved to disk.")
+                return jsonify({"message": "Health data received and updated"}), 200
+            else:
+                print("Received invalid health data format.")
+                return jsonify({"error": "Invalid data format. Requires either 'room_id' or 'vip_rooms', and 'system_health' with 'rtc', 'wifi', 'internet', 'ota'."}), 400
+
+        except Exception as e:
+            print(f"Error processing health update from device: {e}")
+            return jsonify({"error": f"Internal server error: {e}"}), 500
+
+    # GET request handling remains the same - already supports both room_id and vip_room parameters
+    elif request.method == 'GET':
+        # Get the room_id or vip_room from query parameters
+        room_id = request.args.get('room_id')
+        vip_room = request.args.get('vip_room')
+        
+        # Use product_id from vip_rooms table if vip_room parameter is provided
+        if vip_room and not room_id:
+            try:
+                conn = get_db_connection()
+                if not conn:
+                    return jsonify({"error": "Database connection failed"}), 500
+                    
+                cursor = conn.cursor()
+                cursor.execute("SELECT product_id FROM vip_rooms WHERE vip_rooms = %s", (vip_room,))
+                result = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                
+                if result:
+                    room_id = result['product_id']
+                    print(f"Mapped VIP room '{vip_room}' to product_id '{room_id}'")
+                else:
+                    return jsonify({
+                        "error": f"No VIP room found with name '{vip_room}'",
+                        "vip_room": vip_room
+                    }), 404
+            except Exception as e:
+                print(f"Error looking up VIP room: {e}")
+                return jsonify({"error": f"Error looking up VIP room: {e}"}), 500
+        
+        print(f"GET request for /api/system_health with room_id={room_id}")
+        
+        if not room_id:
+            return jsonify({"error": "Missing room_id or vip_room parameter"}), 400
+        
+        if room_id in latest_health_data:
+            response_data = latest_health_data[room_id].copy()
+            
+            # If this was originally a VIP room (it has vip_room_name), 
+            # add both the product_id and the vip_room name
+            if 'vip_room_name' in response_data:
+                response_data['vip_rooms'] = response_data['vip_room_name']
+                
+            return jsonify(response_data)
+        else:
+            # No health data for this room yet
+            return jsonify({
+                "error": f"No health data available for room {room_id}",
+                "room_id": room_id
+            }), 404
+
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.route('/api/system_health/history', methods=['GET'])
+def system_health_history():
+    """
+    API Endpoint to retrieve historical system health data for a specific room.
+    """
+    # Get the room_id or vip_room from query parameters
+    room_id = request.args.get('room_id')
+    vip_room = request.args.get('vip_room')
+    
+    # Use product_id from vip_rooms table if vip_room parameter is provided
+    if vip_room and not room_id:
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return jsonify({"error": "Database connection failed"}), 500
+                
+            cursor = conn.cursor()
+            cursor.execute("SELECT product_id FROM vip_rooms WHERE vip_rooms = %s", (vip_room,))
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if result:
+                room_id = result['product_id']
+                print(f"Mapped VIP room '{vip_room}' to product_id '{room_id}'")
+            else:
+                return jsonify({
+                    "error": f"No VIP room found with name '{vip_room}'",
+                    "vip_room": vip_room,
+                    "history": []
+                }), 404
+        except Exception as e:
+            print(f"Error looking up VIP room: {e}")
+            return jsonify({"error": f"Error looking up VIP room: {e}", "history": []}), 500
+    
+    print(f"GET request for /api/system_health/history with room_id={room_id}")
+    
+    if not room_id:
+        return jsonify({"error": "Missing room_id or vip_room parameter"}), 400
+    
+    # If no history for this room, return empty list
+    if room_id not in health_history:
+        response = jsonify({"history": []})
+    else:
+        # Optional: Allow limiting the number of entries returned
+        limit = request.args.get('limit', default=10, type=int)
+        if limit > MAX_HISTORY_ENTRIES:
+            limit = MAX_HISTORY_ENTRIES
+        
+        # Get the most recent entries up to the limit
+        history_entries = health_history[room_id][-limit:]
+        
+        # Ensure vip_rooms field is included in the response if applicable
+        for entry in history_entries:
+            if 'vip_room_name' in entry:
+                entry['vip_rooms'] = entry['vip_room_name']
+            
+        # Return the history data
+        response = jsonify({"history": history_entries})
+    
+    return response
+
+
+@app.route('/api/system_health/history/all', methods=['GET'])
+def all_system_health_history():
+    """
+    API Endpoint to retrieve historical system health data for all rooms.
+    """
+    print(f"GET request for /system_health/history/all")
+    
+    # Optional: Allow limiting the number of entries returned per room
+    limit = request.args.get('limit', default=50, type=int)
+    if limit > MAX_HISTORY_ENTRIES:
+        limit = MAX_HISTORY_ENTRIES
+    
+    # Prepare a list to hold all history entries
+    all_history = []
+    
+    # Collect history from all rooms
+    for room_id, room_history in health_history.items():
+        # Get the most recent entries up to the limit
+        recent_entries = room_history[-limit:]
+        
+        # Ensure each entry has a room_id field
+        for entry in recent_entries:
+            # Make sure entry has room_id
+            if 'room_id' not in entry:
+                entry['room_id'] = room_id
+                
+            # Include VIP room name if available
+            if 'vip_room_name' in entry:
+                entry['vip_rooms'] = entry['vip_room_name']
+        
+        # Add to the combined list
+        all_history.extend(recent_entries)
+    
+    # Sort all entries by timestamp, most recent first
+    all_history.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    
+    # Optionally limit the total number of entries across all rooms
+    total_limit = request.args.get('total_limit', default=200, type=int)
+    if len(all_history) > total_limit:
+        all_history = all_history[:total_limit]
+    
+    # Return the combined history data
+    return jsonify({"history": all_history})
+
+
+@app.route('/api/ota', methods=['GET'])
+def get_ota_details():
+    """
+    API Endpoint to provide OTA details for a specific room ID.
+    Returns product version, firmware version, and update URL in JSON format.
+    """
+    room_id = request.args.get('room_id') # Expect room_id as a query parameter
+    print(f"Received GET request for /ota with room_id={room_id}")
+
+    ota_details = {
+        "product_version": "Unknown", # This would typically come from the device or a config
+        "Firmware version": "Unknown",
+        "url": None
+    }
+
+    if room_id and room_id in latest_health_data:
+        # Access health data using room_id
+        health_info = latest_health_data[room_id]
+        if "system_health" in health_info and "ota" in health_info["system_health"]:
+            ota_info = health_info["system_health"]["ota"]
+            ota_details = {
+                "product_version": ota_info.get("product_version", "v1.0"), # Assuming device sends this
+                "Firmware version": ota_info.get("current_version", "Unknown"), # Current version from device
+                "url": ota_info.get("update_url", None) # Update URL from device or config
+            }
+        # If the device sends a specific product version, it should be in the health data
+        # Otherwise, "v1.0" or similar is a placeholder for a generic product version
+        ota_details["product_version"] = health_info.get("product_version", ota_details["product_version"])
+
+    return jsonify(ota_details)
+
+@app.route('/api/initiate_ota_update', methods=['POST'])
+def initiate_ota_update():
+    """
+    API Endpoint to initiate an OTA update for a specific room.
+    Expects JSON with 'update_url' and 'room_id'.
+    """
+    try:
+        data = request.get_json()
+        update_url = data.get('update_url')
+        room_id = data.get('room_id') # Changed from product_id
+
+        if not update_url or not room_id:
+            return jsonify({"error": "Missing 'update_url' or 'room_id'"}), 400
+
+        # In a real application, you would send a command to the device
+        # identified by room_id to initiate the OTA update using update_url.
+        # For now, we'll just log it.
+        print(f"Initiating OTA update for room {room_id} with URL: {update_url}")
+
+        # You might want to store this OTA request or push it to a queue
+        # for a device management system to pick up.
+
+        return jsonify({"message": f"OTA update initiated for room {room_id}"}), 200
+
+    except Exception as e:
+        print(f"Error initiating OTA update: {e}")
+        return jsonify({"error": f"Internal server error: {e}"}), 500
+
+
+
+# # # good handling duplicates
 
 @app.route('/api/access_control_data', methods=['GET'])
 def get_access_control_data():
+    try:
+        requested_product_id = request.args.get('product_id')
+        print(f"Access control data requested, product_id: {requested_product_id}")
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Unable to connect to database'}), 500
+
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        response_data = {
+            "cards": [],
+            "products": []
+        }
+
+        # 1. Master and Service Cards - ONLY ACTIVE ONES
+        cursor.execute("""
+            SELECT cp.uid, cp.package_type as type
+            FROM card_packages cp
+            JOIN access_requests ar ON cp.uid = ar.uid
+            WHERE cp.package_type IN ('Master Card', 'Service Card')
+            AND ar.active = TRUE
+            GROUP BY cp.uid, cp.package_type
+        """)
+
+        special_cards = cursor.fetchall()
+        for card in special_cards:
+            response_data['cards'].append({
+                "uid": card['uid'],
+                "type": card['type'],
+                "access_rooms": ["all"],
+                "active": True
+            })
+
+        # 2. Access Matrix
+        cursor.execute("SELECT package_type, facility, has_access FROM access_matrix")
+        package_access = {}
+        for row in cursor.fetchall():
+            pkg_type = row['package_type']
+            facility = row['facility']
+            has_access = row['has_access']
+            package_access.setdefault(pkg_type, {})[facility] = has_access
+
+        # 3. VIP Room Mappings
+        cursor.execute("SELECT product_id, vip_rooms FROM vip_rooms")
+        vip_product_to_facility = {}
+        facility_to_product = {}
+        for row in cursor.fetchall():
+            vip_product_to_facility[row['product_id']] = row['vip_rooms']
+            facility_to_product[row['vip_rooms']] = row['product_id']
+
+        # 4. Get all cards data and create unique card details
+        cursor.execute("""
+            SELECT ar.uid, ar.product_id, COALESCE(cp.package_type, 'General') as type, ar.active
+            FROM access_requests ar
+            LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
+        """)
+
+        all_cards_data = cursor.fetchall()
+        card_details = {}  # Map UID to details (avoiding duplicates by UID)
+        product_cards = {}  # Map product_id to set of card UIDs (to avoid duplicates)
+        
+        for card in all_cards_data:
+            uid = card['uid']
+            product_id = card['product_id']
+            card_type = card['type']
+            
+            # Store unique card details by UID
+            if uid not in card_details:
+                card_details[uid] = {
+                    'uid': uid,
+                    'type': card_type,
+                    'active': card['active']
+                }
+            else:
+                # Update with more specific package type if available
+                if card_type != 'General' and card_details[uid]['type'] == 'General':
+                    card_details[uid]['type'] = card_type
+            
+            # Use set to track unique UIDs per product
+            if product_id not in product_cards:
+                product_cards[product_id] = set()
+            product_cards[product_id].add(uid)
+
+        # 5. Handle VIP room access based on access matrix
+        for facility, vip_product_id in facility_to_product.items():
+            if vip_product_id not in product_cards:
+                product_cards[vip_product_id] = set()
+                
+            # Add Master and Service cards to VIP rooms automatically
+            for uid, card_info in card_details.items():
+                card_type = card_info['type']
+                
+                # Only Master Card and Service Card have universal access
+                if card_type in ['Master Card', 'Service Card']:
+                    product_cards[vip_product_id].add(uid)
+                # Regular package types (including General) - check access matrix
+                else:
+                    if card_type in package_access and facility in package_access[card_type] and package_access[card_type][facility]:
+                        product_cards[vip_product_id].add(uid)
+
+        # 6. Active Guests
+        cursor.execute("""
+            SELECT g.id, g.name, g.card_ui_id as uid, g.room_id,
+                   g.checkin_time as checkin, g.checkout_time as checkout,
+                   p.product_id
+            FROM guest_registrations g
+            JOIN productstable p ON g.room_id = p.room_no
+            WHERE NOW() BETWEEN g.checkin_time AND g.checkout_time
+              AND g.checkout_time > NOW()
+        """)
+
+        all_guests = cursor.fetchall()
+        guests_with_packages = []
+        for guest in all_guests:
+            guest_dict = dict(guest)
+            card_uid = guest_dict['uid']
+            cursor.execute("""
+                SELECT cp.package_type 
+                FROM card_packages cp 
+                JOIN access_requests ar ON cp.uid = ar.uid
+                WHERE cp.uid = %s AND ar.active = TRUE
+                LIMIT 1
+            """, (card_uid,))
+            pkg_result = cursor.fetchone()
+            package_type = pkg_result['package_type'] if pkg_result else 'General'
+
+            # Only add active guest cards
+            cursor.execute("""
+                SELECT active FROM access_requests 
+                WHERE uid = %s AND product_id = %s
+            """, (card_uid, guest_dict['product_id']))
+            card_status = cursor.fetchone()
+            if not card_status or not card_status['active']:
+                continue
+
+            access_rooms = [guest_dict['product_id']]
+            if package_type in package_access:
+                for facility, has_access in package_access[package_type].items():
+                    if has_access and facility in facility_to_product:
+                        access_rooms.append(facility_to_product[facility])
+
+            guests_with_packages.append({
+                "name": guest_dict['name'],
+                "uid": card_uid,
+                "checkin": guest_dict['checkin'].strftime('%Y-%m-%d %H:%M:%S'),
+                "checkout": guest_dict['checkout'].strftime('%Y-%m-%d %H:%M:%S'),
+                "package_type": package_type,
+                "access_rooms": access_rooms
+            })
+
+        guests_by_product = {}
+        for guest in guests_with_packages:
+            for pid in guest['access_rooms']:
+                guests_by_product.setdefault(pid, []).append(guest)
+
+        # 7. Add guest cards (only active ones) - avoid duplicates
+        existing_uids = {card['uid'] for card in response_data['cards']}
+        for guest in guests_with_packages:
+            if guest['uid'] not in existing_uids:
+                response_data['cards'].append({
+                    "uid": guest['uid'],
+                    "type": guest['package_type'],
+                    "active": True,
+                    "access_rooms": guest['access_rooms']
+                })
+                existing_uids.add(guest['uid'])  # Track this UID as added
+
+        # 8. Build final response
+        if requested_product_id:
+            # Handle single product request
+            cursor.execute("SELECT product_id, room_no, COALESCE(updated, FALSE) as updated FROM productstable WHERE product_id = %s", (requested_product_id,))
+            result = cursor.fetchone()
+            if result:
+                # Convert set to list of card objects
+                cards_list = []
+                if result['product_id'] in product_cards:
+                    for uid in product_cards[result['product_id']]:
+                        if uid in card_details:
+                            cards_list.append(card_details[uid])
+                
+                product_data = {
+                    "product_id": result['product_id'], 
+                    "updated": result['updated'],
+                    "cards": cards_list
+                }
+                
+                if result['product_id'] in guests_by_product:
+                    product_data['guests'] = guests_by_product[result['product_id']]
+                    
+                response_data['products'].append(product_data)
+                cursor.execute("UPDATE productstable SET updated = FALSE WHERE product_id = %s", (requested_product_id,))
+
+            cursor.execute("SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated FROM vip_rooms WHERE product_id = %s", (requested_product_id,))
+            vip_result = cursor.fetchone()
+            if vip_result:
+                # Convert set to list of card objects
+                cards_list = []
+                if vip_result['product_id'] in product_cards:
+                    for uid in product_cards[vip_result['product_id']]:
+                        if uid in card_details:
+                            cards_list.append(card_details[uid])
+                
+                product_data = {
+                    "product_id": vip_result['product_id'],
+                    "updated": vip_result['updated'],
+                    "cards": cards_list
+                }
+                
+                if vip_result['product_id'] in guests_by_product:
+                    product_data['guests'] = guests_by_product[vip_result['product_id']]
+                    
+                response_data['products'].append(product_data)
+                cursor.execute("UPDATE vip_rooms SET updated = FALSE WHERE product_id = %s", (requested_product_id,))
+
+            conn.commit()
+        else:
+            # Handle all products request
+            cursor.execute("SELECT product_id, room_no, COALESCE(updated, FALSE) as updated FROM productstable")
+            for row in cursor.fetchall():
+                pid = row['product_id']
+                # Convert set to list of card objects
+                cards_list = []
+                if pid in product_cards:
+                    for uid in product_cards[pid]:
+                        if uid in card_details:
+                            cards_list.append(card_details[uid])
+                
+                product_data = {
+                    "product_id": pid,
+                    "updated": row['updated'],
+                    "cards": cards_list
+                }
+                
+                if pid in guests_by_product:
+                    product_data['guests'] = guests_by_product[pid]
+                    
+                response_data['products'].append(product_data)
+
+            cursor.execute("SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated FROM vip_rooms")
+            for row in cursor.fetchall():
+                pid = row['product_id']
+                # Convert set to list of card objects
+                cards_list = []
+                if pid in product_cards:
+                    for uid in product_cards[pid]:
+                        if uid in card_details:
+                            cards_list.append(card_details[uid])
+                
+                product_data = {
+                    "product_id": pid,
+                    "updated": row['updated'],
+                    "cards": cards_list
+                }
+                
+                if pid in guests_by_product:
+                    product_data['guests'] = guests_by_product[pid]
+                    
+                response_data['products'].append(product_data)
+
+        cursor.close()
+        conn.close()
+
+        response_data['products'] = sorted(response_data['products'], key=lambda x: x['product_id'])
+
+        if requested_product_id:
+            publish_access_control_data(requested_product_id, response_data)
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"Error getting access control data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error fetching access control data: {str(e)}"}), 500
+
+
+
+@app.route('/api/update_card_status', methods=['POST'])
+def update_card_status():
     """
-    Endpoint for ESP32 access control system.
-    Returns consolidated data about cards, products, and guest assignments.
-    Only includes guests whose current time is between their checkin and checkout times.
+    Update the active status of a card for a specific product
     """
     try:
-        # Get the product_id from the request parameters if available
-        requested_product_id = request.args.get('product_id')
+        data = request.json
         
-        print(f"Access control data requested, product_id: {requested_product_id}")
+        if not data or 'product_id' not in data or 'uid' not in data or 'active' not in data:
+            return jsonify({'error': 'Missing required fields'}), 400
+            
+        product_id = data['product_id']
+        uid = data['uid']
+        active = data['active']
         
         # Get database connection
         conn = get_db_connection()
         if not conn:
             return jsonify({'error': 'Unable to connect to database'}), 500
             
-        # For psycopg2, use DictCursor
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # Initialize the response structure
-        response_data = {
-            "cards": [],
-            "products": []
-        }
-        
-        # 1. Fetch master cards and service cards
+        # Update the active status in the database
         cursor.execute("""
-            SELECT cp.uid, cp.package_type as type, 
-                   CASE WHEN cp.package_type IN ('Master Card', 'Service Card') THEN '["all"]'::json
-                        ELSE NULL
-                   END as access_rooms
-            FROM card_packages cp
-            WHERE cp.package_type IN ('Master Card', 'Service Card')
-        """)
+            UPDATE access_requests
+            SET active = %s
+            WHERE product_id = %s AND uid = %s
+        """, (active, product_id, uid))
         
-        special_cards = cursor.fetchall()
-        
-        # Process special cards
-        for card in special_cards:
-            card_data = dict(card)
-            
-            # Make sure access_rooms is properly processed
-            if isinstance(card_data['access_rooms'], str):
-                import json
-                card_data['access_rooms'] = json.loads(card_data['access_rooms'])
-            elif card_data['access_rooms'] is None:
-                card_data['access_rooms'] = ["all"]  # Both Service and Master cards get all access
-            
-            card_data['active'] = True
-            response_data['cards'].append(card_data)
-
-        # 2. First get the access matrix
+        # Set the product as updated to ensure changes are synced to devices
         cursor.execute("""
-            SELECT package_type, facility, has_access 
-            FROM access_matrix
-        """)
+            UPDATE productstable
+            SET updated = TRUE
+            WHERE product_id = %s
+        """, (product_id,))
         
-        package_access = {}
-        for row in cursor.fetchall():
-            pkg_type = row['package_type']
-            facility = row['facility']
-            has_access = row['has_access']
-            
-            if pkg_type not in package_access:
-                package_access[pkg_type] = {}
-                
-            package_access[pkg_type][facility] = has_access
-        
-        # 3. Get VIP room mappings
+        # Also check if it's a VIP room and update it if needed
         cursor.execute("""
-            SELECT product_id, vip_rooms 
-            FROM vip_rooms
-        """)
+            UPDATE vip_rooms
+            SET updated = TRUE
+            WHERE product_id = %s
+        """, (product_id,))
         
-        vip_product_to_facility = {}
-        facility_to_product = {}
+        # Commit the changes
+        conn.commit()
         
-        for row in cursor.fetchall():
-            vip_product_to_facility[row['product_id']] = row['vip_rooms']
-            facility_to_product[row['vip_rooms']] = row['product_id']
-            
-        # 4. Get all active guests - using NOW() BETWEEN ensures only current guests are included
-        cursor.execute("""
-            SELECT g.id, g.name, g.card_ui_id as uid, g.room_id,
-                   g.checkin_time as checkin, g.checkout_time as checkout
-                   p.product_id
-            FROM guest_registrations g
-            JOIN productstable p ON g.room_id = p.room_no
-            WHERE NOW() BETWEEN g.checkin_time AND g.checkout_time
-            AND g.checkout_time > NOW()  
-        """)
-        
-        all_guests = cursor.fetchall()
-        
-        # Debug: Print current time and guest count
-        cursor.execute("SELECT NOW() as current_time")
-        current_time = cursor.fetchone()['current_time']
-        print(f"Current server time: {current_time}")
-        print(f"Found {len(all_guests)} active guests")
-        
-        # 5. Get package type for each guest's card and simplify guest objects
-        guests_with_packages = []
-        for guest in all_guests:
-            guest_dict = dict(guest)
-            card_uid = guest_dict['uid']
-            
-            # Get package type for this card
-            cursor.execute("""
-                SELECT package_type
-                FROM card_packages
-                WHERE uid = %s
-                LIMIT 1
-            """, (card_uid,))
-            
-            package_result = cursor.fetchone()
-            if package_result:
-                guest_dict['package_type'] = package_result['package_type']
-            else:
-                guest_dict['package_type'] = 'Standard'  # Default if no package assigned
-                
-            # Calculate access rooms for this guest
-            access_rooms = [guest_dict['product_id']]  # Always has access to assigned room
-            
-            # Check which VIP facilities this package has access to
-            if guest_dict['package_type'] in package_access:
-                for facility, has_access in package_access[guest_dict['package_type']].items():
-                    if has_access and facility in facility_to_product:
-                        vip_product_id = facility_to_product[facility]
-                        access_rooms.append(vip_product_id)
-            
-            guest_dict['access_rooms'] = access_rooms
-            
-            # Convert datetime objects to strings
-            # if isinstance(guest_dict['checkin'], datetime):
-            #     guest_dict['checkin'] = guest_dict['checkin'].isoformat()
-            
-            # if isinstance(guest_dict['checkout'], datetime):
-            #     guest_dict['checkout'] = guest_dict['checkout'].isoformat()
-
-            # Convert datetime objects to human-readable strings without the 'T'
-            if isinstance(guest_dict['checkin'], datetime):
-               guest_dict['checkin'] = guest_dict['checkin'].strftime('%Y-%m-%d %H:%M:%S')
-
-            if isinstance(guest_dict['checkout'], datetime):
-               guest_dict['checkout'] = guest_dict['checkout'].strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Create simplified guest object with only necessary fields
-            simplified_guest = {
-                "name": guest_dict['name'],
-                "uid": guest_dict['uid'],
-                "checkin": guest_dict['checkin'],
-                "checkout": guest_dict['checkout'],
-                "package_type": guest_dict['package_type'],
-                "access_rooms": guest_dict['access_rooms']
-            }
-            
-            guests_with_packages.append(simplified_guest)
-        
-        # Create mappings for guests by their access products
-        guests_by_product = {}
-        for guest in guests_with_packages:
-            for product_id in guest['access_rooms']:
-                if product_id not in guests_by_product:
-                    guests_by_product[product_id] = []
-                guests_by_product[product_id].append(guest)
-        
-        # Now fetch and process all products
-        if requested_product_id:
-            # If a specific product_id is requested
-            cursor.execute("""
-                SELECT product_id, room_no, COALESCE(updated, FALSE) as updated
-                FROM productstable
-                WHERE product_id = %s
-            """, (requested_product_id,))
-            
-            regular_product = cursor.fetchone()
-            
-            if regular_product:
-                product_data = {
-                    "product_id": regular_product['product_id'],
-                    "updated": regular_product['updated'],
-                    "cards": []
-                }
-                
-                # Get cards
-                cursor.execute("""
-                    SELECT ar.uid, 
-                          COALESCE(cp.package_type, 'Standard') as type,
-                          TRUE as active
-                    FROM access_requests ar
-                    LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-                    WHERE ar.product_id = %s
-                    GROUP BY ar.uid, cp.package_type
-                """, (regular_product['product_id'],))
-                
-                for card in cursor.fetchall():
-                    product_data['cards'].append(dict(card))
-                
-                # Add guests if applicable
-                if regular_product['product_id'] in guests_by_product:
-                    product_data['guests'] = guests_by_product[regular_product['product_id']]
-                
-                response_data['products'].append(product_data)
-                
-                # Mark as updated = false
-                cursor.execute("""
-                    UPDATE productstable
-                    SET updated = FALSE
-                    WHERE product_id = %s
-                """, (requested_product_id,))
-                conn.commit()
-            
-            # Check if it's a VIP room
-            cursor.execute("""
-                SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated
-                FROM vip_rooms
-                WHERE product_id = %s
-            """, (requested_product_id,))
-            
-            vip_room = cursor.fetchone()
-            
-            if vip_room:
-                product_data = {
-                    "product_id": vip_room['product_id'],
-                    "updated": vip_room['updated'],
-                    "cards": []
-                }
-                
-                # Get cards
-                cursor.execute("""
-                    SELECT ar.uid, 
-                           COALESCE(cp.package_type, 'Standard') as type,
-                           TRUE as active
-                    FROM access_requests ar
-                    LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-                    WHERE ar.product_id = %s
-                    GROUP BY ar.uid, cp.package_type
-                """, (vip_room['product_id'],))
-                
-                for card in cursor.fetchall():
-                    product_data['cards'].append(dict(card))
-                
-                # Add guests if any has access to this VIP room
-                if vip_room['product_id'] in guests_by_product:
-                    product_data['guests'] = guests_by_product[vip_room['product_id']]
-                
-                response_data['products'].append(product_data)
-                
-                # Mark as updated = false
-                cursor.execute("""
-                    UPDATE vip_rooms
-                    SET updated = FALSE
-                    WHERE product_id = %s
-                """, (requested_product_id,))
-                conn.commit()
-        else:
-            # Get all products
-            cursor.execute("""
-                SELECT product_id, room_no, COALESCE(updated, FALSE) as updated
-                FROM productstable
-            """)
-            
-            for product in cursor.fetchall():
-                product_data = {
-                    "product_id": product['product_id'],
-                    "updated": product['updated'],
-                    "cards": []
-                }
-                
-                # Get cards
-                cursor.execute("""
-                    SELECT ar.uid, 
-                           COALESCE(cp.package_type, 'Standard') as type,
-                           TRUE as active
-                    FROM access_requests ar
-                    LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-                    WHERE ar.product_id = %s
-                    GROUP BY ar.uid, cp.package_type
-                """, (product['product_id'],))
-                
-                for card in cursor.fetchall():
-                    product_data['cards'].append(dict(card))
-                
-                # Add guests if applicable
-                if product['product_id'] in guests_by_product:
-                    product_data['guests'] = guests_by_product[product['product_id']]
-                
-                response_data['products'].append(product_data)
-            
-            # Also get all VIP rooms
-            cursor.execute("""
-                SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated
-                FROM vip_rooms
-            """)
-            
-            for vip in cursor.fetchall():
-                product_data = {
-                    "product_id": vip['product_id'],
-                    "updated": vip['updated'],
-                    "cards": []
-                }
-                
-                # Get cards
-                cursor.execute("""
-                    SELECT ar.uid, 
-                           COALESCE(cp.package_type, 'Standard') as type,
-                           TRUE as active
-                    FROM access_requests ar
-                    LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-                    WHERE ar.product_id = %s
-                    GROUP BY ar.uid, cp.package_type
-                """, (vip['product_id'],))
-                
-                for card in cursor.fetchall():
-                    product_data['cards'].append(dict(card))
-                
-                # Add guests if any has access to this VIP room
-                if vip['product_id'] in guests_by_product:
-                    product_data['guests'] = guests_by_product[vip['product_id']]
-                
-                response_data['products'].append(product_data)
+        # Trigger an update notification for this product
+        publish_access_control_data(product_id, None)
         
         cursor.close()
         conn.close()
         
-        return jsonify(response_data)
-    
+        return jsonify({
+            'success': True,
+            'message': f"Card {uid} for product {product_id} has been {'activated' if active else 'disabled'}"
+        })
+        
     except Exception as e:
-        print(f"Error getting access control data: {str(e)}")
+        print(f"Error updating card status: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({
-            'error': f"Error fetching access control data: {str(e)}"
+            'error': f"Error updating card status: {str(e)}"
+        }), 500, 
+
+
+
+
+
+@app.route('/api/test', methods=['GET'])
+def test_endpoint():
+    return jsonify({"message": "CORS is working"})
+
+
+
+
+# Now, let's fix the activity history endpoint to handle OPTIONS requests properly
+@app.route('/api/users/activity-history', methods=['GET', 'OPTIONS'])
+def get_all_activity_history():
+    """Get all user activity history with pagination."""
+    # Handle OPTIONS request (preflight)
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+
+    try:
+        # Get current user from session/token
+        # Comment this out temporarily to test if it's causing the issue
+        # current_user = get_current_user_from_token()
+        # if not current_user:
+        #     return jsonify({'error': 'Authentication required'}), 401
+        
+        # # Only allow admin roles to access this endpoint
+        # if current_user['role'] not in ['super_admin', 'admin', 'manager']:
+        #     return jsonify({'error': 'Unauthorized access'}), 403
+        
+        # Parse pagination parameters
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 10, type=int)
+        
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Unable to connect to database'}), 500
+            
+        cursor = conn.cursor(cursor_factory=RealDictCursor)  # Use RealDictCursor here
+        
+        # Check if user_history table exists
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'user_history'
+            )
+        """)
+        
+        table_exists = cursor.fetchone()['exists']
+        
+        if not table_exists:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    change_type VARCHAR(50) NOT NULL,
+                    previous_value TEXT,
+                    new_value TEXT,
+                    changed_by_id INTEGER,
+                    changed_by_email VARCHAR(255),
+                    timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+            # Return empty result since table was just created
+            return jsonify({
+                'activity': {
+                    'records': [],
+                    'totalCount': 0,
+                    'currentPage': page,
+                    'pageSize': page_size
+                }
+            }), 200
+        
+        # Count total records for pagination
+        cursor.execute("SELECT COUNT(*) FROM user_history")
+        total_count = cursor.fetchone()['count']
+        
+        # Query with pagination
+        cursor.execute("""
+            SELECT 
+                uh.id, 
+                uh.user_id,
+                u.email as user_email,
+                uh.change_type,
+                uh.previous_value,
+                uh.new_value,
+                uh.changed_by_id,
+                uh.changed_by_email,
+                uh.timestamp
+            FROM 
+                user_history uh
+            LEFT JOIN
+                users u ON uh.user_id = u.id
+            ORDER BY 
+                uh.timestamp DESC
+            LIMIT %s OFFSET %s
+        """, (page_size, (page - 1) * page_size))
+        
+        records = cursor.fetchall()
+        
+        # Format the results
+        history_records = []
+        for record in records:
+            history_records.append({
+                'id': record['id'],
+                'user_id': record['user_id'],
+                'user_email': record['user_email'] or 'Unknown User',
+                'change_type': record['change_type'],
+                'previous_value': record['previous_value'],
+                'new_value': record['new_value'],
+                'changed_by_id': record['changed_by_id'],
+                'changed_by_email': record['changed_by_email'] or 'System',
+                'timestamp': record['timestamp'].isoformat() if record['timestamp'] else None
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'activity': {
+                'records': history_records,
+                'totalCount': total_count,
+                'currentPage': page,
+                'pageSize': page_size
+            }
+        }), 200
+    
+    except Exception as e:
+        print(f"Error fetching activity history: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error fetching activity history: {str(e)}"}), 500
+
+
+
+
+
+
+
+
+
+@app.route('/api/managers', methods=['POST'])
+def register_manager():
+    """API endpoint for registering a new manager"""
+    try:
+        # Get JSON data from request
+        data = request.json
+        if not data:
+            return jsonify({
+                'error': "Missing request data"
+            }), 400
+            
+        # Extract required fields
+        manager_id = data.get('managerId')
+        name = data.get('name')
+        role = data.get('role', 'manager')  # Default to 'manager' if not provided
+        card_ui_id = data.get('cardUiId')
+        
+        # Validate required fields
+        if not all([manager_id, name, card_ui_id]):
+            return jsonify({
+                'error': "Missing required fields: managerId, name, and cardUiId are required"
+            }), 400
+            
+        # Get database connection
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database"
+            }), 500
+            
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Check if the manager ID already exists
+        cursor.execute("SELECT COUNT(*) FROM managers WHERE manager_id = %s", (manager_id,))
+        if cursor.fetchone()['count'] > 0:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': f"Manager with ID {manager_id} already exists"
+            }), 409  # Conflict
+            
+        # Check if the card is already assigned to another manager
+        cursor.execute("SELECT COUNT(*) FROM managers WHERE card_ui_id = %s", (card_ui_id,))
+        if cursor.fetchone()['count'] > 0:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': f"Card {card_ui_id} is already assigned to another manager"
+            }), 409  # Conflict
+        
+        # Insert the new manager
+        cursor.execute("""
+            INSERT INTO managers (manager_id, name, role, card_ui_id)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        """, (manager_id, name, role, card_ui_id))
+        
+        # Get the newly created manager's ID
+        new_id = cursor.fetchone()['id']
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': "Manager registered successfully",
+            'id': new_id
+        }), 201  # Created
+        
+    except Exception as e:
+        print(f"Error registering manager: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': f"Error registering manager: {str(e)}"
+        }), 500
+
+
+@app.route('/api/managers/<manager_id>', methods=['PUT'])
+def update_manager_string(manager_id):
+    """API endpoint for updating a manager with string ID"""
+    try:
+        # Convert to int if possible (for backward compatibility)
+        try:
+            int_id = int(manager_id)
+            return update_manager(int_id)
+        except ValueError:
+            # If not an integer, continue with string-based logic
+            pass
+            
+        # Get JSON data from request
+        data = request.json
+        if not data:
+            return jsonify({
+                'error': "Missing request data"
+            }), 400
+            
+        # Get database connection
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database"
+            }), 500
+            
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Check if the manager exists by manager_id instead of id
+        cursor.execute("SELECT * FROM managers WHERE manager_id = %s", (manager_id,))
+        existing_manager = cursor.fetchone()
+        
+        if not existing_manager:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': f"No manager found with Manager ID {manager_id}"
+            }), 404
+            
+        # Extract fields to update
+        name = data.get('name', existing_manager['name'])
+        role = data.get('role', existing_manager['role'])
+        card_ui_id = data.get('cardUiId', existing_manager['card_ui_id'])
+        
+        # Check if the new card_ui_id is already assigned to another manager
+        if card_ui_id != existing_manager['card_ui_id']:
+            cursor.execute("""
+                SELECT COUNT(*) FROM managers 
+                WHERE card_ui_id = %s AND id != %s
+            """, (card_ui_id, existing_manager['id']))
+            
+            if cursor.fetchone()['count'] > 0:
+                cursor.close()
+                conn.close()
+                return jsonify({
+                    'error': f"Card {card_ui_id} is already assigned to another manager"
+                }), 409  # Conflict
+        
+        # Update the manager
+        cursor.execute("""
+            UPDATE managers 
+            SET name = %s, role = %s, card_ui_id = %s
+            WHERE manager_id = %s
+        """, (name, role, card_ui_id, manager_id))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': "Manager updated successfully",
+            'manager_id': manager_id
+        })
+        
+    except Exception as e:
+        print(f"Error updating manager: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': f"Error updating manager: {str(e)}"
         }), 500
 
 
 
-# @app.route('/api/access_control_data', methods=['GET'])
-# def get_access_control_data():
-#     """
-#     Endpoint for ESP32 access control system.
-#     Returns consolidated data about cards, products, and guest assignments.
-#     Simplified guest objects and removed duplicate guest/guests fields.
-#     """
-#     try:
-#         # Get the product_id from the request parameters if available
-#         requested_product_id = request.args.get('product_id')
-        
-#         print(f"Access control data requested, product_id: {requested_product_id}")
-        
-#         # Get database connection
-#         conn = get_db_connection()
-#         if not conn:
-#             return jsonify({'error': 'Unable to connect to database'}), 500
-            
-#         # For psycopg2, use DictCursor
-#         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-#         # Initialize the response structure
-#         response_data = {
-#             "cards": [],
-#             "products": []
-#         }
-        
-#         # 1. Fetch master cards and service cards
-#         cursor.execute("""
-#             SELECT cp.uid, cp.package_type as type, 
-#                    CASE WHEN cp.package_type IN ('Master Card', 'Service Card') THEN '["all"]'::json
-#                         ELSE NULL
-#                    END as access_rooms
-#             FROM card_packages cp
-#             WHERE cp.package_type IN ('Master Card', 'Service Card')
-#         """)
-        
-#         special_cards = cursor.fetchall()
-        
-#         # Process special cards
-#         for card in special_cards:
-#             card_data = dict(card)
-            
-#             # Make sure access_rooms is properly processed
-#             if isinstance(card_data['access_rooms'], str):
-#                 import json
-#                 card_data['access_rooms'] = json.loads(card_data['access_rooms'])
-#             elif card_data['access_rooms'] is None:
-#                 card_data['access_rooms'] = ["all"]  # Both Service and Master cards get all access
-            
-#             card_data['active'] = True
-#             response_data['cards'].append(card_data)
 
-#         # 2. First get the access matrix
-#         cursor.execute("""
-#             SELECT package_type, facility, has_access 
-#             FROM access_matrix
-#         """)
+
+@app.route('/api/managers', methods=['GET'])
+def get_managers():
+    """API endpoint for retrieving all managers"""
+    try:
+        # Get database connection
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database",
+                'managers': []
+            }), 500
+            
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-#         package_access = {}
-#         for row in cursor.fetchall():
-#             pkg_type = row['package_type']
-#             facility = row['facility']
-#             has_access = row['has_access']
-            
-#             if pkg_type not in package_access:
-#                 package_access[pkg_type] = {}
-                
-#             package_access[pkg_type][facility] = has_access
+        # Check if managers table exists, create if not
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS managers (
+                manager_id VARCHAR(50) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL DEFAULT 'manager',
+                card_ui_id VARCHAR(255) UNIQUE NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.commit()
         
-#         # 3. Get VIP room mappings
-#         cursor.execute("""
-#             SELECT product_id, vip_rooms 
-#             FROM vip_rooms
-#         """)
+        # Get all managers
+        cursor.execute("""
+            SELECT manager_id, name, role, card_ui_id, created_at
+            FROM managers
+            ORDER BY created_at DESC
+        """)
         
-#         vip_product_to_facility = {}
-#         facility_to_product = {}
+        managers = cursor.fetchall()
         
-#         for row in cursor.fetchall():
-#             vip_product_to_facility[row['product_id']] = row['vip_rooms']
-#             facility_to_product[row['vip_rooms']] = row['product_id']
+        # Format for response
+        result = []
+        for manager in managers:
+            result.append({
+                'id': manager['manager_id'],  # Use manager_id as the id
+                'managerId': manager['manager_id'],
+                'name': manager['name'],
+                'role': manager['role'],
+                'cardUiId': manager['card_ui_id'],
+                'createdAt': manager['created_at'].isoformat() if manager['created_at'] else None
+            })
             
-#         # 4. Get all active guests
-#         cursor.execute("""
-#             SELECT g.id, g.name, g.card_ui_id as uid, g.room_id,
-#                    g.checkin_time as checkin, g.checkout_time as checkout,
-#                    p.product_id
-#             FROM guest_registrations g
-#             JOIN productstable p ON g.room_id = p.room_no
-#             WHERE NOW() BETWEEN g.checkin_time AND g.checkout_time
-#         """)
+        cursor.close()
+        conn.close()
         
-#         all_guests = cursor.fetchall()
+        return jsonify({
+            'managers': result
+        })
         
-#         # 5. Get package type for each guest's card and simplify guest objects
-#         guests_with_packages = []
-#         for guest in all_guests:
-#             guest_dict = dict(guest)
-#             card_uid = guest_dict['uid']
+    except Exception as e:
+        print(f"Error getting managers: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': f"Error fetching managers: {str(e)}",
+            'managers': []
+        }), 500
+
+
+
+@app.route('/api/managers/<manager_id>', methods=['DELETE'])
+def delete_manager(manager_id):
+    """API endpoint for deleting a manager"""
+    try:
+        # Get database connection
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'error': "Unable to connect to database"
+            }), 500
             
-#             # Get package type for this card
-#             cursor.execute("""
-#                 SELECT package_type
-#                 FROM card_packages
-#                 WHERE uid = %s
-#                 LIMIT 1
-#             """, (card_uid,))
-            
-#             package_result = cursor.fetchone()
-#             if package_result:
-#                 guest_dict['package_type'] = package_result['package_type']
-#             else:
-#                 guest_dict['package_type'] = 'Standard'  # Default if no package assigned
-                
-#             # Calculate access rooms for this guest
-#             access_rooms = [guest_dict['product_id']]  # Always has access to assigned room
-            
-#             # Check which VIP facilities this package has access to
-#             if guest_dict['package_type'] in package_access:
-#                 for facility, has_access in package_access[guest_dict['package_type']].items():
-#                     if has_access and facility in facility_to_product:
-#                         vip_product_id = facility_to_product[facility]
-#                         access_rooms.append(vip_product_id)
-            
-#             guest_dict['access_rooms'] = access_rooms
-            
-#             # Convert datetime objects to strings
-#             if isinstance(guest_dict['checkin'], datetime):
-#                 guest_dict['checkin'] = guest_dict['checkin'].isoformat()
-            
-#             if isinstance(guest_dict['checkout'], datetime):
-#                 guest_dict['checkout'] = guest_dict['checkout'].isoformat()
-            
-#             # Create simplified guest object with only necessary fields
-#             simplified_guest = {
-#                 "name": guest_dict['name'],
-#                 "uid": guest_dict['uid'],
-#                 "checkin": guest_dict['checkin'],
-#                 "checkout": guest_dict['checkout'],
-#                 "package_type": guest_dict['package_type'],
-#                 "access_rooms": guest_dict['access_rooms']
-#             }
-            
-#             guests_with_packages.append(simplified_guest)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-#         # Create mappings for guests by their access products
-#         guests_by_product = {}
-#         for guest in guests_with_packages:
-#             for product_id in guest['access_rooms']:
-#                 if product_id not in guests_by_product:
-#                     guests_by_product[product_id] = []
-#                 guests_by_product[product_id].append(guest)
+        # Delete the manager
+        cursor.execute("DELETE FROM managers WHERE manager_id = %s", (manager_id,))
         
-#         # Now fetch and process all products
-#         if requested_product_id:
-#             # If a specific product_id is requested
-#             cursor.execute("""
-#                 SELECT product_id, room_no, COALESCE(updated, FALSE) as updated
-#                 FROM productstable
-#                 WHERE product_id = %s
-#             """, (requested_product_id,))
-            
-#             regular_product = cursor.fetchone()
-            
-#             if regular_product:
-#                 product_data = {
-#                     "product_id": regular_product['product_id'],
-#                     "updated": regular_product['updated'],
-#                     "cards": []
-#                 }
-                
-#                 # Get cards
-#                 cursor.execute("""
-#                     SELECT ar.uid, 
-#                           COALESCE(cp.package_type, 'Standard') as type,
-#                           TRUE as active
-#                     FROM access_requests ar
-#                     LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-#                     WHERE ar.product_id = %s
-#                     GROUP BY ar.uid, cp.package_type
-#                 """, (regular_product['product_id'],))
-                
-#                 for card in cursor.fetchall():
-#                     product_data['cards'].append(dict(card))
-                
-#                 # Add guests if applicable
-#                 if regular_product['product_id'] in guests_by_product:
-#                     product_data['guests'] = guests_by_product[regular_product['product_id']]
-                
-#                 response_data['products'].append(product_data)
-                
-#                 # Mark as updated = false
-#                 cursor.execute("""
-#                     UPDATE productstable
-#                     SET updated = FALSE
-#                     WHERE product_id = %s
-#                 """, (requested_product_id,))
-#                 conn.commit()
-            
-#             # Check if it's a VIP room
-#             cursor.execute("""
-#                 SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated
-#                 FROM vip_rooms
-#                 WHERE product_id = %s
-#             """, (requested_product_id,))
-            
-#             vip_room = cursor.fetchone()
-            
-#             if vip_room:
-#                 product_data = {
-#                     "product_id": vip_room['product_id'],
-#                     "updated": vip_room['updated'],
-#                     "cards": []
-#                 }
-                
-#                 # Get cards
-#                 cursor.execute("""
-#                     SELECT ar.uid, 
-#                            COALESCE(cp.package_type, 'Standard') as type,
-#                            TRUE as active
-#                     FROM access_requests ar
-#                     LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-#                     WHERE ar.product_id = %s
-#                     GROUP BY ar.uid, cp.package_type
-#                 """, (vip_room['product_id'],))
-                
-#                 for card in cursor.fetchall():
-#                     product_data['cards'].append(dict(card))
-                
-#                 # Add guests if any has access to this VIP room
-#                 if vip_room['product_id'] in guests_by_product:
-#                     product_data['guests'] = guests_by_product[vip_room['product_id']]
-                
-#                 response_data['products'].append(product_data)
-                
-#                 # Mark as updated = false
-#                 cursor.execute("""
-#                     UPDATE vip_rooms
-#                     SET updated = FALSE
-#                     WHERE product_id = %s
-#                 """, (requested_product_id,))
-#                 conn.commit()
-#         else:
-#             # Get all products
-#             cursor.execute("""
-#                 SELECT product_id, room_no, COALESCE(updated, FALSE) as updated
-#                 FROM productstable
-#             """)
-            
-#             for product in cursor.fetchall():
-#                 product_data = {
-#                     "product_id": product['product_id'],
-#                     "updated": product['updated'],
-#                     "cards": []
-#                 }
-                
-#                 # Get cards
-#                 cursor.execute("""
-#                     SELECT ar.uid, 
-#                            COALESCE(cp.package_type, 'Standard') as type,
-#                            TRUE as active
-#                     FROM access_requests ar
-#                     LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-#                     WHERE ar.product_id = %s
-#                     GROUP BY ar.uid, cp.package_type
-#                 """, (product['product_id'],))
-                
-#                 for card in cursor.fetchall():
-#                     product_data['cards'].append(dict(card))
-                
-#                 # Add guests if applicable
-#                 if product['product_id'] in guests_by_product:
-#                     product_data['guests'] = guests_by_product[product['product_id']]
-                
-#                 response_data['products'].append(product_data)
-            
-#             # Also get all VIP rooms
-#             cursor.execute("""
-#                 SELECT product_id, vip_rooms, COALESCE(updated, FALSE) as updated
-#                 FROM vip_rooms
-#             """)
-            
-#             for vip in cursor.fetchall():
-#                 product_data = {
-#                     "product_id": vip['product_id'],
-#                     "updated": vip['updated'],
-#                     "cards": []
-#                 }
-                
-#                 # Get cards
-#                 cursor.execute("""
-#                     SELECT ar.uid, 
-#                            COALESCE(cp.package_type, 'Standard') as type,
-#                            TRUE as active
-#                     FROM access_requests ar
-#                     LEFT JOIN card_packages cp ON ar.uid = cp.uid AND ar.product_id = cp.product_id
-#                     WHERE ar.product_id = %s
-#                     GROUP BY ar.uid, cp.package_type
-#                 """, (vip['product_id'],))
-                
-#                 for card in cursor.fetchall():
-#                     product_data['cards'].append(dict(card))
-                
-#                 # Add guests if any has access to this VIP room
-#                 if vip['product_id'] in guests_by_product:
-#                     product_data['guests'] = guests_by_product[vip['product_id']]
-                
-#                 response_data['products'].append(product_data)
+        # Check if a row was actually deleted
+        if cursor.rowcount == 0:
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'error': f"No manager found with ID {manager_id}"
+            }), 404
         
-#         cursor.close()
-#         conn.close()
+        conn.commit()
+        cursor.close()
+        conn.close()
         
-#         return jsonify(response_data)
-    
-#     except Exception as e:
-#         print(f"Error getting access control data: {str(e)}")
-#         import traceback
-#         traceback.print_exc()
-#         return jsonify({
-#             'error': f"Error fetching access control data: {str(e)}"
-#         }), 500
+        return jsonify({
+            'message': f"Manager {manager_id} deleted successfully"
+        })
+        
+    except Exception as e:
+        print(f"Error deleting manager: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': f"Error deleting manager: {str(e)}"
+        }), 500
+
+
+
+
+@app.route('/api/managers', methods=['OPTIONS'])
+def options_managers():
+    response = app.make_default_options_response()
+    return response
+
+
+@app.route('/api/managers/<manager_id>', methods=['OPTIONS'])
+def options_manager_detail(manager_id):
+    response = app.make_default_options_response()
+    response.headers['Access-Control-Allow-Methods'] = 'GET, PUT, DELETE'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+
+@app.route('/api/assign_card', methods=['POST', 'OPTIONS'])
+def assign_card():
+    """API endpoint for assigning a card to a product"""
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': "Missing request data"}), 400
+            
+        product_id = data.get('product_id')
+        uid = data.get('uid')
+        package_type = data.get('package_type', 'General')
+        
+        if not product_id or not uid:
+            return jsonify({'error': "Product ID and UID are required"}), 400
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': "Unable to connect to database"}), 500
+            
+        # Log incoming data for debugging
+        print(f"Assigning card - Product ID: {product_id}, UID: {uid}, Package: {package_type}")
+        
+        cursor = conn.cursor()
+        
+        # Current timestamp for database
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        created_at = datetime.now()
+        
+        # TRANSACTION: Wrap all DB operations in a transaction
+        cursor.execute("BEGIN")
+        try:
+
+            # 1. Insert into access_requests (remove ON CONFLICT)
+            cursor.execute("""
+                INSERT INTO access_requests (uid, product_id, access_status, active, timestamp, created_at)
+                VALUES (%s, %s, 'Assigned', TRUE, %s, %s)
+            """, (uid, product_id, current_time_str, created_at))
+
+            # 2. Insert into card_packages (remove ON CONFLICT)
+            cursor.execute("""
+                INSERT INTO card_packages (uid, product_id, package_type)
+                VALUES (%s, %s, %s)
+            """, (uid, product_id, package_type))
+            
+            # Print debug info
+            cursor.execute("SELECT * FROM card_packages WHERE uid = %s AND product_id = %s", (uid, product_id))
+            pkg_result = cursor.fetchone()
+            print(f"Card package after update: {pkg_result}")
+            
+            cursor.execute("SELECT * FROM access_requests WHERE uid = %s AND product_id = %s", (uid, product_id))
+            access_result = cursor.fetchone()
+            print(f"Access request after update: {access_result}")
+            
+            # Commit the transaction
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            print(f"Transaction error: {str(e)}")
+            raise e
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'message': f"Card {uid} successfully assigned to product {product_id} with {package_type} package",
+            'refresh_needed': True
+        })
+        
+    except Exception as e:
+        print(f"Error assigning card: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f"Error assigning card: {str(e)}"}), 500
+
 
 
 
 if __name__ == '__main__':
+
+
     print("Starting Flask application...")
-    app.config['DEBUG'] = True
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Start MQTT thread
+    mqtt_thread_instance = threading.Thread(target=mqtt_thread)
+    mqtt_thread_instance.daemon = True
+    mqtt_thread_instance.start()
+    print("MQTT client thread started")
+    app.config['DEBUG'] = False
+    app.run(debug=False, host='0.0.0.0', port=5000)
