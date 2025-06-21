@@ -44,13 +44,7 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         return None
 
-# # MQTT broker config
-# # MQTT_BROKER = "172.16.4.62" 
-# # MQTT_BROKER = "127.0.0.1"  
-# MQTT_BROKER = "mqtt.zenvinnovations.com"  # Use localhost for local testing
-# MQTT_PORT = 9001  # Use WebSocket port
-# # MQTT_TOPIC = "/hotel/esp32/devices/#"
-# MQTT_TOPIC = "/RFID/access_control_data/product_id"  
+
 
 MQTT_BROKER = os.getenv("MQTT_BROKER")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))  # Default to 1883 if not set
