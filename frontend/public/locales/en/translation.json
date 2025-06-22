@@ -1,0 +1,68 @@
+{
+    "language": "English",
+    "dashboard": {
+      "title": "Dashboard",
+      "totalEntries": "Number of RFID Entries",
+      "checkinTrends": "Time-based Check-in Trends",
+      "roomAccess": "Room-based Access Frequency",
+      "manageTables": "Manage Tables"
+    },
+    "rfidEntries": {
+      "title": "RFID Entry Records",
+      "search": "Search...",
+      "export": "Export",
+      "id": "ID",
+      "uid": "UID",
+      "timestamp": "Timestamp",
+      "productId": "Product ID",
+      "status": "Status",
+      "createdAt": "Created At",
+      "actions": "Actions",
+      "noEntries": "No entries found",
+      "loading": "Loading RFID entries..."
+    },
+    "login": {
+      "title": "Admin Login",
+      "subtitle": "Access the dashboard with your credentials",
+      "email": "Email Address",
+      "password": "Password",
+      "signIn": "Sign In",
+      "authenticating": "Authenticating...",
+      "emailPlaceholder": "Enter your email",
+      "passwordPlaceholder": "Enter your password",
+      "credentialsHelp": "Use the credentials provided by your administrator"
+    },
+    "userManagement": {
+      "title": "User Management",
+      "systemUsers": "System Users",
+      "addUser": "Add User",
+      "newUser": "Add New User",
+      "email": "Email Address",
+      "password": "Password",
+      "role": "Role",
+      "admin": "Admin",
+      "manager": "Manager",
+      "createdAt": "Created At",
+      "actions": "Actions",
+      "cancel": "Cancel",
+      "save": "Add User",
+      "saving": "Saving...",
+      "noUsers": "No users found",
+      "loading": "Loading users..."
+    },
+    "manageTables": {
+      "title": "Manage Products & Cards",
+      "products": "Products",
+      "cards": "Cards",
+      "addProduct": "Add Product",
+      "addCard": "Add Card",
+      "productId": "Product ID",
+      "roomId": "Room ID",
+      "cardId": "Card ID",
+      "actions": "Actions",
+      "save": "Save",
+      "cancel": "Cancel",
+      "noProducts": "No products defined",
+      "noCards": "No cards defined"
+    }
+  }

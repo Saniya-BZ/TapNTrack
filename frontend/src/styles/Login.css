@@ -1,0 +1,398 @@
+/* Login.css - Enhanced responsive styling with professional ZenV branding */
+
+/* Base container for the login page */
+.login-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  background: #f8f9fa;
+  padding: 1rem;
+  box-sizing: border-box;
+}
+
+/* Main card that contains the two halves */
+.login-card {
+  display: flex;
+  width: 100%;
+  max-width: 1000px;
+  min-height: 550px;
+  background-color: #fff;
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+/* Left side with logo */
+.login-logo-container {
+  display: flex;
+  flex: 1;
+  /* Using the second gradient from your image */
+  background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+  color: white;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.login-logo-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+  opacity: 0.1;
+}
+
+.logo-content {
+  text-align: center;
+  z-index: 1;
+}
+
+.logo {
+  margin-bottom: 1.5rem;
+  display: flex;
+  justify-content: center;
+}
+
+.hotel-icon {
+  font-size : 5rem;
+  color:#ffffff;
+  margin-bottom: 1rem;
+}
+
+.main-logo {
+  width: 120px;
+  height: 120px;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+.company-name {
+  font-size: 2.25rem;
+  font-weight: 700;
+  margin-bottom: 0.625rem;
+  letter-spacing: 0.5px;
+}
+
+.company-tagline {
+  font-size: 1rem;
+  opacity: 0.9;
+  margin-bottom: 1.5rem;
+  letter-spacing: 1px;
+}
+
+/* Right side with form */
+.login-form-container {
+  flex: 1;
+  padding: 2.5rem;
+  display: flex;
+  align-items: center;
+  background-color: #fff;
+}
+
+.login-form-content {
+  width: 100%;
+}
+
+.login-title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: #2c3e50;
+  margin-bottom: 0.5rem;
+}
+
+.login-subtitle {
+  color: #7f8c8d;
+  margin-bottom: 1.875rem;
+  font-size: 0.9375rem;
+}
+
+.login-error {
+  background-color: rgba(231, 76, 60, 0.1);
+  color: #dc3545;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1.25rem;
+  display: flex;
+  align-items: center;
+  font-size: 0.875rem;
+  border-left: 4px solid #dc3545;
+}
+
+.error-icon {
+  margin-right: 0.625rem;
+  font-size: 1rem;
+}
+
+.login-form .form-group {
+  margin-bottom: 1.25rem;
+}
+
+.login-form label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+  color: #343a40;
+  font-size: 0.875rem;
+}
+
+.input-with-icon {
+  position: relative;
+}
+
+.input-icon {
+  position: absolute;
+  left: 0.9375rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #7f8c8d;
+}
+
+.login-form input {
+  width: 100%;
+  padding: 0.875rem 0.875rem 0.875rem 2.8125rem;
+  border: 1px solid #e9ecef;
+  border-radius: 6px;
+  font-size: 0.9375rem;
+  transition: all 0.3s ease;
+  box-sizing: border-box;
+  background-color: #f8f9fa;
+}
+
+/* Adjust padding for the password input to make room for the eye icon */
+.login-form input[type="password"],
+.login-form input[type="text"] {
+  padding-right: 2.8125rem;
+}
+
+.login-form input:focus {
+  border-color: #3498db;
+  box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+  outline: none;
+  background-color: #fff;
+}
+
+/* Password toggle button styles */
+.password-toggle-btn {
+  position: absolute;
+  right: 0.9375rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6c757d;
+  transition: color 0.2s;
+}
+
+.password-toggle-btn:hover,
+.password-toggle-btn:focus {
+  color: #3498db;
+  outline: none;
+}
+
+.password-toggle-icon {
+  font-size: 1.125rem;
+}
+
+.login-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 0.875rem;
+  background: #3498db;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  margin-top: 1.875rem;
+  box-shadow: 0 4px 10px rgba(34, 198, 212, 0.2);
+}
+
+.login-button:hover {
+  background: #2980b9;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 15px rgba(52, 152, 219, 0.2);
+}
+
+.login-button:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.button-icon {
+  margin-right: 0.625rem;
+}
+
+.login-help {
+  margin-top: 1.875rem;
+  text-align: center;
+  color: #7f8c8d;
+  font-size: 0.875rem;
+}
+
+/* Responsive styles */
+@media (max-width: 991.98px) {
+  .login-card {
+    max-width: 90%;
+  }
+  
+  .login-logo-container,
+  .login-form-container {
+    padding: 1.5rem;
+  }
+  
+  .main-logo {
+    width: 100px;
+    height: 100px;
+  }
+  
+  .company-name {
+    font-size: 1.5rem;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .login-card {
+    flex-direction: column;
+    max-width: 95%;
+    min-height: auto;
+  }
+  
+  .login-logo-container {
+    min-height: 200px;
+    padding: 1.25rem;
+  }
+  
+  .main-logo {
+    width: 90px;
+    height: 90px;
+    margin-bottom: 0.625rem;
+  }
+  
+  .company-name {
+    font-size: 1.375rem;
+    margin-bottom: 0.3125rem;
+  }
+  
+  .company-tagline {
+    font-size: 0.875rem;
+    margin-bottom: 0.625rem;
+  }
+  
+  .login-form-container {
+    padding: 1.5rem;
+  }
+  
+  .login-title {
+    font-size: 1.375rem;
+  }
+  
+  .login-subtitle {
+    font-size: 0.875rem;
+    margin-bottom: 1.25rem;
+  }
+  
+  .login-button {
+    margin-top: 1.25rem;
+  }
+  
+  .login-help {
+    margin-top: 1.25rem;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .login-container {
+    padding: 0.5rem;
+  }
+  
+  .login-card {
+    border-radius: 8px;
+  }
+  
+  .login-logo-container {
+    min-height: 150px;
+    padding: 1rem;
+  }
+  
+  .main-logo {
+    width: 80px;
+    height: 80px;
+  }
+  
+  .company-name {
+    font-size: 1.25rem;
+  }
+  
+  .company-tagline {
+    font-size: 0.75rem;
+  }
+  
+  .login-form-container {
+    padding: 1.25rem;
+  }
+  
+  .login-title {
+    font-size: 1.25rem;
+  }
+  
+  .login-subtitle {
+    font-size: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  
+  .login-form input {
+    padding: 0.75rem 0.75rem 0.75rem 2.5rem;
+    font-size: 0.875rem;
+  }
+  
+  .password-toggle-btn {
+    right: 0.75rem;
+  }
+  
+  .login-button {
+    padding: 0.75rem;
+    font-size: 0.875rem;
+  }
+  
+  .login-error {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+  }
+}
+
+/* For very small mobile screens */
+@media (max-width: 359.98px) {
+  .login-logo-container {
+    min-height: 120px;
+  }
+  
+  .main-logo {
+    width: 70px;
+    height: 70px;
+  }
+  
+  .company-name {
+    font-size: 1.125rem;
+  }
+  
+  .company-tagline {
+    font-size: 0.6875rem;
+  }
+}

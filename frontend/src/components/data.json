@@ -1,0 +1,149 @@
+{
+    "cards": [
+      {
+        "uid": "9A22BE16",
+        "type": "Master Card",
+        "access_rooms": ["all"],
+        "active": true
+      },
+      {
+        "uid": "F9BD0004",
+        "type": "Master Card",
+        "access_rooms": ["all"],
+        "active": true
+      },
+      {
+        "uid": "BA35FE03",
+        "type": "Service Card",
+        "access_rooms": ["p121", "p122", "p123", "p124"],
+        "active": true
+      },
+      {
+        "uid": "F9BD0004",
+        "type": "Service Card",
+        "access_rooms": ["p126"],
+        "active": true
+      }
+    ],
+    "products": [
+      {
+        "product_id": "p121",
+        "updated": false,
+        "cards": [
+          {
+            "uid": "BA35FE03",
+            "type": "Suite",
+            "active": true
+          },
+          {
+            "uid": "F9BD0004",
+            "type": "Deluxe",
+            "active": true
+          },
+          {
+            "uid": "FD44C001",
+            "type": "Executive",
+            "active": true
+          }
+        ]
+      },
+      {
+        "product_id": "p122",
+        "updated": false,
+        "cards": [
+          {
+            "uid": "BA35FE03",
+            "type": "Service Card",
+            "active": true
+          },
+          {
+            "uid": "CA08AD16",
+            "type": "Standard",
+            "active": true
+          },
+          {
+            "uid": "F39CA313",
+            "type": "Suite",
+            "active": true
+          }
+
+        ],
+        
+            "guest": {
+              "uid": "CA08AD16",
+              "name": "Saniya",
+              "checkin": "2025-04-16 11:00:32.13",
+              "checkout": "2025-04-17 11:00:32.13",
+              "access_rooms": ["p122"]
+            }
+      },
+      {
+        "product_id": "p123",
+        "updated": false,
+        "cards": [
+          {
+            "uid": "24846A09",
+            "type": "Suite",
+            "active": true
+          },
+          {
+            "uid": "9A22BE16",
+            "type": "Master Card",
+            "active": true
+          },
+          {
+            "uid": "BA35FE03",
+            "type": "Executive",
+            "active": true
+          }
+        ]
+      },
+      {
+        "product_id": "p124",
+        "updated": false,
+        "cards": [
+          {
+            "uid": "BA35FE03",
+            "type": "Standard",
+            "active": true
+          },
+          {
+            "uid": "BACD6116",
+            "type": "Executive",
+            "active": true
+          },
+          {
+            "uid": "CAA87E16",
+            "type": "Deluxe",
+            "active": true
+          },
+          {
+            "uid": "F39CA313",
+            "type": "Executive",
+            "active": true
+          },
+          {
+            "uid": "F9BD0004",
+            "type": "Master Card",
+            "active": true
+          }
+        ]
+      },
+      {
+        "product_id": "p126",
+        "updated": false,
+        "cards": [
+          {
+            "uid": "F9BD0004",
+            "type": "Service Card",
+            "active": true
+          },
+          {
+            "uid": "FD44C001",
+            "type": "Suite",
+            "active": true
+          }
+        ]
+      }
+    ]
+  }
