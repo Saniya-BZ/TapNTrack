@@ -1,212 +1,175 @@
+# TapNTrack
 # Hotel RFID Access Control System
 
 A comprehensive solution for hotel access management using RFID technology with a multi-role administrative dashboard.
 
-## Overview
+---
 
-This system provides a secure and efficient way for hotels to manage guest access, monitor security, and streamline front desk operations while maintaining clear lines of communication between different staff roles.
+## 📌 Overview
 
+This system provides a secure and efficient way for hotels to manage guest access, monitor security, and streamline front desk operations while maintaining clear communication across all staff roles.
 
-## Features
+---
 
-- 🔐 RFID card-based access control for hotel rooms
-- 👥 Role-based user management (Super Admin, Admin, Manager, Clerk)
-- 📝 Guest registration with Aadhar verification
-- 🏨 Room and card mapping management
-- 📊 Access analytics and reporting
-- 🔔 Support helpdesk system for staff communication
-- 📱 Responsive design for all devices
+## 🚀 Features
 
-## User Roles & Permissions
+- 🔐 **RFID card-based access control** for hotel rooms and facilities  
+- 👥 **Role-based user management** with 4 roles: Super Admin, Admin, Manager, Clerk  
+- 📝 **Guest registration with Aadhar verification** and room/card assignment  
+- 🏨 **Room and card configuration** including types, restrictions, and packages  
+- 📊 **Advanced analytics dashboards**: check-in trends, room frequency, activity charts  
+- 🔎 **RFID entry logs** with detailed filtering by status, timestamp, room  
+- 🗂️ **Access Groups**: customizable permission matrices for different card types  
+- 💳 **Card Management**: register, activate, deactivate, or revoke cards  
+- 📬 **Helpdesk module** for staff support, ticket tracking, and communication  
+- 🌐 **Multi-language support**: English, Hindi, Telugu  
+- 🔄 **Real-time updates** and activity monitoring  
+- 📱 **Responsive design**: optimized for mobile, tablet, and desktop  
+- 👤 **User profile settings** with password update and preferences  
+- 🔐 **Secure authentication** with JWT tokens and 24-hour session expiration  
+- 🧩 **Modular REST API** backend with extendable structure
+- 👥 **AI Assistant ChatBot** answers to all the queries
 
-| Role | Permissions |
-|------|-------------|
-| **Super Admin** | System-wide access (except Helpdesk), user management for all roles |
-| **Admin** | Analytics, user management (except Super Admin), helpdesk support, room/card management |
-| **Manager** | Limited analytics, clerk management, helpdesk support, guest registration |
-| **Clerk** | Guest registration, helpdesk ticket creation |
+---
 
-## Key Modules
+## 👤 User Roles & Permissions
 
-### Authentication System
-- Secure JWT-based authentication
-- Session management
-- Role-based access control
-- Session tokens are generated on login
-- Tokens expire after 24 hours
+| Role         | Permissions                                                                 |
+|--------------|------------------------------------------------------------------------------|
+| Super Admin  | System-wide access (except Helpdesk), full user management                  |
+| Admin        | Analytics, user management (except Super Admin), helpdesk, room/card config |
+| Manager      | Limited analytics, clerk management, helpdesk, guest registration           |
+| Clerk        | Guest registration, helpdesk ticket creation                                |
 
+---
 
+## 📄 Key Modules
+
+### 🔐 Authentication System
+
+- JWT-based login authentication
+- Session tokens with 24-hour expiration
+- Role-based access and route control
+
+---
 
 ## 🛠️ Tech Stack
 
-- **Backend**: Python (Flask)
-- **Database**: PostgreSQL (via psycopg2)
-- **Authentication**: Session/token-based
+### Backend
+
+- **Language**: Python (Flask)
+- **Database**: PostgreSQL (via `psycopg2`)
 - **API Type**: RESTful
-- **Security**: Password hashing, role-based access control
-- **CORS**: Enabled (for frontend communication)
+- **Auth**: JWT tokens with session control
+- **Security**: Password hashing, RBAC
+- **CORS**: Enabled for frontend communication
 
 ### Frontend
-- React with React Router
+
+- React (with React Router)
 - React Bootstrap
 - Context API for state management
-
-
-### Backend
-- Flask (Python)
-- PostgreSQL database
-- RESTful API architecture
-- JWT authentication
+- i18next for multi-language support
 
 ---
 
 ## 🧱 Database Tables
 
-| Table Name           | Description                                      |
-|----------------------|--------------------------------------------------|
-| `access_requests`    | Logs all RFID access attempts                    |
-| `productstable`      | Maps product IDs to rooms                        |
-| `cardids`            | Associates card IDs with rooms/facilities        |
-| `users`              | Manages system users and their roles             |
-| `sessions`           | Tracks session tokens                            |
-| `guest_registrations`| Guest details and room assignments               |
-| `help_messages`      | In-app messaging                                 |
-| `card_packages`      | Access package definitions                       |
-| `access_matrix`      | Permissions matrix for card packages             |
+| Table Name             | Description                                  |
+|------------------------|----------------------------------------------|
+| `access_requests`      | Logs RFID access attempts                    |
+| `productstable`        | Maps product IDs to rooms                    |
+| `cardids`              | Links card IDs with rooms/facilities         |
+| `users`                | Manages user accounts and roles              |
+| `sessions`             | Tracks active session tokens                 |
+| `guest_registrations`  | Guest data and room assignments              |
+| `help_messages`        | Internal messaging and support tickets       |
+| `card_packages`        | Defines card-based access packages           |
+| `access_matrix`        | Permission definitions for card packages     |
 
 ---
 
+## 🧭 System Pages Overview
 
-## 🎯 Key Features
+### **Core Pages**
+
+1. **Dashboard**  
+   - Real-time KPIs, charts, and activity feed
+
+2. **RFID Entries**  
+   - Log of all access events with filters for status, location, time
+
+3. **Register Guest**  
+   - Guest check-in and RFID assignment
+
+4. **Room Management**  
+   - Configure rooms, assign restrictions, monitor use
+
+5. **Check-in Trends**  
+   - Time-based guest activity analytics
+
+6. **Room Frequency**  
+   - Shows most accessed rooms and usage heatmaps
+
+---
+
+### **Administrative Pages**
+
+7. **User Management**  
+   - Add/edit/delete users and assign roles
+
+8. **Card Management**  
+   - Register/manage RFID cards and their status
+
+9. **Access Groups**  
+   - Define permission groups and access rules
+
+10. **Helpdesk**  
+    - Internal support/ticket system for staff issues
+
+---
+
+### **Account Pages**
+
+11. **Login**  
+    - Secure login with role-based redirection
+
+12. **Profile Settings**  
+    - Update personal details and change passwords
+
+---
+
+## 🎯 Key Functional Highlights
 
 ### ✅ Access Control
-- Validates card IDs and room permissions
-- Logs every access attempt
 
-### 📊 Dashboard
+- Validates card-room pairings
+- Logs access attempts with timestamps and status
+
+### 📊 Dashboard & Analytics
+
 - Activity heatmaps
-- Room usage stats
-- Denied vs. granted attempts
+- Check-in trends and room frequency stats
+- Denied vs. granted logs
 
 ### 👥 User Management
-- Add/update/delete users
-- Role assignment
-- Password hashing
 
-### 🏨 Room & Card Setup
-- Configure rooms
-- Assign cards and packages
+- Secure password hashing
+- Full role management via Admin portal
+
+### 🛏️ Room & Card Setup
+
+- Create/edit/delete rooms
+- Assign RFID card packages
 
 ### 📝 Guest Management
+
 - Register/check-in guests
-- Temporary access cards
+- Assign temporary or permanent access
 
-### 📬 Help Desk
-- Role-based internal messaging
+### 💬 Helpdesk
 
----
+- In-app ticketing for internal communication
 
-## 🔌 API Endpoints (Partial List)
-
-### 🔐 Authentication
-- `POST /api/login`  
-- `POST /api/logout`  
-- `GET /api/check-session`
-
-### 🧠 Access Processing
-- `POST /access`  
-- `GET /api/rfid_entries`  
-- `GET /api/checkin_trends`
-
-### 📈 Dashboard
-- `GET /api/dashboard`
-
-### 👤 User Management
-- `GET /api/users`  
-- `POST /api/users`
-
-### 🛏️ Room/Card Setup
-- `GET /api/manage_tables`  
-- `POST /api/manage_tables`
-
-### 🚪 Guest Registration
-- `POST /api/register_guest`  
-- `GET /api/guests`  
-- `PUT /api/guests/<id>`  
-- `DELETE /api/guests/<id>`
-
-### 💬 Help Desk
-- `GET /api/help-messages`  
-- `POST /api/help-messages`  
-
----
-
-### Local Setup Guide
-
-## 📁 Project Structure
-
-The project is organized into two main parts:
-
-rfid-admin-project/ ├── backend/ └── frontend/
-
-
----
-
-## 🔧 Step 1: Backend Setup
-
-### Prerequisites
-
-- Python 3.6 or higher  
-- PostgreSQL database server  
-- Pip (Python package manager)  
-
-### Database Configuration
-
-1. **Install PostgreSQL** (if not already installed)  
-2. **Create a new PostgreSQL database**:
-   - **Database Name**: `accessdb`
-   - **Username**: `postgres`
-   - **Password**: `postgres`
-   - **Port**: `5432`
-
-### Running the Backend
-
-```bash
-# Navigate to the backend directory
-cd rfid-admin-project/backend
-
-# Install required Python packages
-pip install Flask psycopg2-binary flask-cors Werkzeug
-
-# Run the Flask application
-python app.py
-
-```
-
-✅ The backend server will start at: https://rfid.zenvinnovations.com/backend
-
-
-### 💻 Step 2: Frontend Setup
-
-### Prerequisites
-- Node.js and npm (Node Package Manager)
-
-### Running the Frontend
-
-```bash
-
-# Navigate to the frontend directory
-cd rfid-admin-project/frontend
-
-# Install dependencies (only needed once)
-npm install
-
-# Start the frontend development server
-npm start
-
-```
-
-✅ The frontend will be available at: http://localhost:3000
-
-
-
+### 👥 AI Assistant Chatbot
+- In-app answers of the queries
